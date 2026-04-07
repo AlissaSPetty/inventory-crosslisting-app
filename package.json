@@ -1,0 +1,16 @@
+{
+  "name": "inventory-crosslisting-app",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm --filter @inv/api --filter @inv/web --parallel run dev",
+    "dev:api": "pnpm --filter @inv/api dev",
+    "dev:web": "pnpm --filter @inv/web dev",
+    "build": "pnpm --filter @inv/shared build && pnpm --filter @inv/api build && pnpm --filter @inv/web build",
+    "test": "pnpm --filter @inv/api test",
+    "typecheck": "pnpm run -r typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

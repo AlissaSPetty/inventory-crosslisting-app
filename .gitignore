@@ -1,0 +1,25 @@
+node_modules
+dist
+*.log
+.DS_Store
+coverage
+.turbo
+
+# Secrets — env files (templates named *.env.example stay tracked)
+.env
+**/.env
+!**/.env.example
+.env.*
+!.env.example
+.env.local
+.env.*.local
+
+# Editor local history (often copies of .env and other secrets)
+.history/
+
+# Supabase CLI local cache
+supabase/.temp/
+
+# Local scratch / chat exports (do not commit)
+/Untitled
+/plan.jsonl

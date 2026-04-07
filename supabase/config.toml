@@ -1,0 +1,13 @@
+# Minimal config for local development — run `supabase start` when developing locally
+
+project_id = "inventory-crosslisting-local"
+
+[api]
+enabled = true
+
+[db]
+port = 54322
+
+[studio]
+enabled = true
+port = 54323
