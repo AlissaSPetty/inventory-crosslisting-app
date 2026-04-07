@@ -1,0 +1,8 @@
+#!/bin/sh
+# Auto-refresh README.md when handoff.md is committed (opt-in: git config core.hooksPath .githooks)
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+if git diff --cached --name-only | grep -qx 'handoff.md'; then
+  node "$ROOT/scripts/sync-readme-from-handoff.mjs" || exit 1
+  git add README.md
+fi

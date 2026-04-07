@@ -8,7 +8,9 @@
     "dev:web": "pnpm --filter @inv/web dev",
     "build": "pnpm --filter @inv/shared build && pnpm --filter @inv/api build && pnpm --filter @inv/web build",
     "test": "pnpm --filter @inv/api test",
-    "typecheck": "pnpm run -r typecheck"
+    "typecheck": "pnpm run -r typecheck",
+    "sync:readme": "node scripts/sync-readme-from-handoff.mjs",
+    "verify:readme": "node scripts/verify-readme-sync.mjs"
   },
   "devDependencies": {
     "typescript": "^5.7.2"
