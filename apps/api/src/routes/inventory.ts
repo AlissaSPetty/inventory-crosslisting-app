@@ -18,6 +18,7 @@ export async function registerInventoryRoutes(app: FastifyInstance, env: Env) {
     const { data, error } = await auth.supabase
       .from("inventory_items")
       .select("*, inventory_images(count)")
+      .eq("status", "active")
       .order("created_at", { ascending: false });
     if (error) return reply.status(500).send({ error: error.message });
     type Row = (typeof data)[number] & {

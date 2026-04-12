@@ -1,4 +1,9 @@
-import type { PlatformAdapter, AdapterResult, NormalizedListing } from "./types.js";
+import type {
+  PlatformAdapter,
+  AdapterResult,
+  FetchActiveListingsData,
+  NormalizedListing,
+} from "./types.js";
 import {
   ebaySiteIdFromMarketplaceId,
   fetchAllMyEbayActiveListingsTrading,
@@ -14,11 +19,63 @@ type EbayCreds = {
 const EBAY_API = (sandbox: boolean) =>
   sandbox ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
+type EbayOfferLite = {
+  listingId?: string;
+  availableQuantity?: number;
+  listingStartDate?: string;
+  marketplaceId?: string;
+  status?: string;
+  listing?: { listingId?: string; listingStatus?: string; listingOnHold?: boolean };
+};
+
+/** @see https://developer.ebay.com/api-docs/sell/inventory/types/slr:ListingStatusEnum */
+const EBAY_REST_LIVE_LISTING_STATUSES = new Set(["ACTIVE", "OUT_OF_STOCK"]);
+
 /**
- * Inventory API rows are SKU-keyed; Trading API rows use listing `ItemID`. We previously skipped
- * Trading when the listing id was already “seen”, which dropped Trading’s URL/photo whenever the
- * offer call failed to return `listingId` or product images were empty. Merge Trading into the
- * Inventory row when they refer to the same listing, then append Trading-only rows.
+ * True only when the offer’s listing is in a live sellable state on eBay (ACTIVE or OUT_OF_STOCK).
+ * Rejects INACTIVE, ENDED, UNSOLD_NOT_RELISTED, empty/unknown statuses, etc.
+ * @see https://developer.ebay.com/api-docs/sell/inventory/resources/offer/methods/getOffers
+ */
+function isEbayOfferLiveForSale(o: EbayOfferLite): boolean {
+  const lid = o.listingId ?? o.listing?.listingId;
+  if (typeof lid !== "string" || !lid.trim()) return false;
+
+  const offerStatus = (o.status ?? "").toUpperCase();
+  if (offerStatus === "UNPUBLISHED") return false;
+
+  if (o.listing?.listingOnHold === true) {
+    return false;
+  }
+
+  const listingStatus = (o.listing?.listingStatus ?? "").toUpperCase();
+  if (!listingStatus) {
+    // Newly published offers sometimes return a listing id before `listing.listingStatus` is set.
+    // If we skip the SKU, sync never touches the app-created `platform_listings` row and prune deletes it.
+    if (offerStatus === "PUBLISHED") return true;
+    if (!offerStatus.trim()) return true;
+    return false;
+  }
+  return EBAY_REST_LIVE_LISTING_STATUSES.has(listingStatus);
+}
+
+function pickLiveOfferForMarketplace(
+  offers: EbayOfferLite[],
+  marketplaceId: string
+): EbayOfferLite | undefined {
+  const live = offers.filter(isEbayOfferLiveForSale);
+  if (!live.length) return undefined;
+  const byMp = live.find((o) => o.marketplaceId === marketplaceId);
+  if (byMp) return byMp;
+  if (live.length === 1) return live[0];
+  return live.find((o) => o.listingId ?? o.listing?.listingId);
+}
+
+/**
+ * Sell Inventory API decides **which** listings exist (Seller Hub “Active” / offer `listingStatus`).
+ * Trading (`GetMyeBaySelling` ActiveList) is used only to **enrich** those rows (URL/photo when the
+ * REST offer payload is thin). We do **not** append Trading-only rows: they often correspond to
+ * legacy or non–Inventory listings that appear under Seller Hub “Inactive” / ended views, not
+ * `/sh/lst/active`.
  */
 function mergeEbayTradingIntoInventoryListings(
   invListings: NormalizedListing[],
@@ -60,25 +117,44 @@ function mergeEbayTradingIntoInventoryListings(
     }
   }
 
-  const invSkus = new Set(invListings.map((x) => x.externalListingId));
-  const seenItemIds = new Set<string>();
-  for (const l of invListings) {
-    const id = l.url?.match(/\/itm\/(\d+)/)?.[1];
-    if (id) seenItemIds.add(id);
-    const em = l.metadata as { ebayListingId?: string } | undefined;
-    if (em?.ebayListingId) seenItemIds.add(em.ebayListingId);
+  return invListings;
+}
+
+/**
+ * One logical listing can appear twice before merge (e.g. SKU row + Trading row with same ItemID).
+ * Collapse to a single row per eBay listing id or SKU so sync `total` matches user-visible listings.
+ */
+function dedupeEbayNormalizedListings(rows: NormalizedListing[]): NormalizedListing[] {
+  const byKey = new Map<string, NormalizedListing>();
+
+  function keyFor(r: NormalizedListing): string {
+    const m = r.metadata as { ebayListingId?: string } | undefined;
+    const fromUrl = r.url?.match(/\/itm\/(\d+)/)?.[1];
+    const itemId = m?.ebayListingId ?? (fromUrl && /^\d+$/.test(fromUrl) ? fromUrl : undefined);
+    if (itemId && /^\d+$/.test(String(itemId))) {
+      return `item:${itemId}`;
+    }
+    return `sku:${String(r.externalListingId)}`;
   }
 
-  const out = [...invListings];
-  for (const t of tradingListings) {
-    if (usedTradingIds.has(t.externalListingId)) continue;
-    if (seenItemIds.has(t.externalListingId)) continue;
-    const tSku = (t.metadata as { sku?: string } | undefined)?.sku;
-    if (tSku && invSkus.has(tSku)) continue;
-    seenItemIds.add(t.externalListingId);
-    out.push(t);
+  function score(r: NormalizedListing): number {
+    const m = r.metadata as { sku?: string } | undefined;
+    let s = 0;
+    if (r.url) s += 4;
+    if (r.imageUrl) s += 2;
+    if (m?.sku) s += 1;
+    if (r.title?.trim()) s += 1;
+    return s;
   }
-  return out;
+
+  for (const r of rows) {
+    const k = keyFor(r);
+    const prev = byKey.get(k);
+    if (!prev || score(r) > score(prev)) {
+      byKey.set(k, r);
+    }
+  }
+  return [...byKey.values()];
 }
 
 /** Sell Inventory API rejects invalid or missing `Accept-Language` (e.g. error 25709). */
@@ -157,7 +233,7 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
   return {
     platform: "ebay",
     async fetchActiveListings(credentials: unknown, cursor?: string): Promise<
-      AdapterResult<{ listings: NormalizedListing[]; nextCursor?: string }>
+      AdapterResult<FetchActiveListingsData>
     > {
       const creds = credentials as EbayCreds;
       if (!creds?.accessToken) {
@@ -218,16 +294,9 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
             headers: headersRead(creds.accessToken),
           });
           if (offerRes.ok) {
-            let offersJson: {
-              offers?: Array<{
-                listingId?: string;
-                availableQuantity?: number;
-                listingStartDate?: string;
-                marketplaceId?: string;
-              }>;
-            };
+            let offersJson: { offers?: EbayOfferLite[] };
             try {
-              offersJson = (await offerRes.json()) as typeof offersJson;
+              offersJson = (await offerRes.json()) as { offers?: EbayOfferLite[] };
             } catch {
               offersJson = { offers: [] };
             }
@@ -241,33 +310,34 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
               });
               if (fb.ok) {
                 try {
-                  const fbJson = (await fb.json()) as typeof offersJson;
+                  const fbJson = (await fb.json()) as { offers?: EbayOfferLite[] };
                   offers = fbJson.offers ?? [];
                 } catch {
                   /* keep empty */
                 }
               }
             }
-            const offer =
-              offers.find(
-                (o) =>
-                  o.listingId &&
-                  (o.marketplaceId === ebayMarketplaceId || offers.length === 1)
-              ) ?? offers.find((o) => o.listingId);
-            if (offer?.listingId) {
-              offerListingId = offer.listingId;
-              listingUrl = isSandbox
-                ? `https://sandbox.ebay.com/itm/${offer.listingId}`
-                : `https://www.ebay.com/itm/${offer.listingId}`;
+            const offer = pickLiveOfferForMarketplace(offers, ebayMarketplaceId);
+            if (!offer) {
+              continue;
             }
-            if (typeof offer?.availableQuantity === "number") {
+            const oid = offer.listingId ?? offer.listing?.listingId;
+            if (oid) {
+              offerListingId = oid;
+              listingUrl = isSandbox
+                ? `https://sandbox.ebay.com/itm/${oid}`
+                : `https://www.ebay.com/itm/${oid}`;
+            }
+            if (typeof offer.availableQuantity === "number") {
               quantity = offer.availableQuantity;
             } else if (typeof d?.shipQty === "number") {
               quantity = d.shipQty;
             }
-            if (typeof offer?.listingStartDate === "string" && offer.listingStartDate.length) {
+            if (typeof offer.listingStartDate === "string" && offer.listingStartDate.length) {
               listedAt = offer.listingStartDate;
             }
+          } else {
+            continue;
           }
 
           listings.push({
@@ -284,13 +354,7 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
             },
           });
         } catch {
-          listings.push({
-            externalListingId: it.sku,
-            title: it.product?.title?.trim() ?? it.sku,
-            quantity: 1,
-            status: "active",
-            metadata: { sku: it.sku },
-          });
+          /* Skip SKUs we cannot classify as a live published listing */
         }
       }
 
@@ -310,7 +374,14 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
       }
 
       const next = items.length === limit ? String(pageIndex + 1) : undefined;
-      return { ok: true, data: { listings, nextCursor: next } };
+      return {
+        ok: true,
+        data: {
+          listings: dedupeEbayNormalizedListings(listings),
+          nextCursor: next,
+          ebayInventorySkusThisPage: items.length,
+        },
+      };
     },
     async setInventoryQuantity(
       credentials: unknown,

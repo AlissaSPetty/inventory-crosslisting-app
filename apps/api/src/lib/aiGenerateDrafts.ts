@@ -36,11 +36,14 @@ export async function runAiDraftGenerationCore(
 ): Promise<AiDraftGenerationResult> {
   const { data: item, error: itemErr } = await service
     .from("inventory_items")
-    .select("id, title, sku, user_id")
+    .select("id, title, sku, user_id, status")
     .eq("id", inventoryItemId)
     .single();
   if (itemErr || !item || item.user_id !== userId) {
     return { ok: false, message: "Item not found" };
+  }
+  if (item.status !== "active") {
+    return { ok: false, message: "Inventory item is not active" };
   }
 
   if (!env.GEMINI_API_KEY) {

@@ -55,6 +55,20 @@ function parsePaginationInSection(sectionXml: string): { totalPages: number } {
 }
 
 /** Trading Item blocks may include multiple `<PictureURL>` tags or a single `GalleryURL`. */
+/**
+ * Prefer `SellingStatus` → `ListingStatus` (Trading schema); else top-level `ListingStatus` on the item.
+ */
+function extractTradingListingStatus(block: string): string | undefined {
+  const ss = block.match(/<(?:[\w.-]+:)?SellingStatus\b[^>]*>([\s\S]*?)<\/(?:[\w.-]+:)?SellingStatus>/i);
+  if (ss) {
+    const inner = ss[1];
+    const ls = inner.match(/<(?:[\w.-]+:)?ListingStatus>([^<]*)<\/(?:[\w.-]+:)?ListingStatus>/i);
+    if (ls?.[1]?.trim()) return ls[1].trim().toLowerCase();
+  }
+  const top = block.match(/<(?:[\w.-]+:)?ListingStatus>([^<]*)<\/(?:[\w.-]+:)?ListingStatus>/i);
+  return top?.[1]?.trim().toLowerCase();
+}
+
 function firstPictureUrlFromItemBlock(block: string): string | undefined {
   const picRe = /<(?:[\w.-]+:)?PictureURL>([^<]*)<\/(?:[\w.-]+:)?PictureURL>/gi;
   let m: RegExpExecArray | null;
@@ -73,9 +87,9 @@ function parseItemFromBlock(
   opts?: { activeListingOnly?: boolean; listingSource?: string }
 ): NormalizedListing | null {
   if (opts?.activeListingOnly) {
-    const ls = block.match(/<(?:[\w.-]+:)?ListingStatus>([^<]*)<\/(?:[\w.-]+:)?ListingStatus>/i);
-    const v = ls?.[1]?.trim().toLowerCase();
-    if (v && v !== "active") return null;
+    /** Match Seller Hub “Active” — require explicit `Active` in Trading XML (see `SellingStatus`). */
+    const listingSt = extractTradingListingStatus(block);
+    if (listingSt !== "active") return null;
   }
 
   const idM = block.match(/<(?:[\w.-]+:)?ItemID>(\d+)<\/(?:[\w.-]+:)?ItemID>/i);
@@ -94,8 +108,8 @@ function parseItemFromBlock(
   }
   let imageUrl = firstPictureUrlFromItemBlock(block);
   let listedAt: string | undefined;
-  const st = block.match(/<(?:[\w.-]+:)?StartTime>([^<]+)<\/(?:[\w.-]+:)?StartTime>/i);
-  if (st?.[1]) listedAt = st[1].trim();
+  const startM = block.match(/<(?:[\w.-]+:)?StartTime>([^<]+)<\/(?:[\w.-]+:)?StartTime>/i);
+  if (startM?.[1]) listedAt = startM[1].trim();
 
   return {
     externalListingId: itemId,
@@ -187,58 +201,18 @@ async function fetchGetMyeBaySellingPages(
     const activeInner = extractActiveListInnerXml(xml);
     if (!activeInner) {
       if (pageNumber === 1) {
-        all.push(...parseItemsFromItemBlocks(xml, itmBase));
+        all.push(...parseItemsFromItemBlocks(xml, itmBase, { activeListingOnly: true }));
       }
       break;
     }
 
     const { totalPages } = parsePaginationInSection(activeInner);
-    all.push(...parseItemsFromItemBlocks(activeInner, itmBase));
+    all.push(...parseItemsFromItemBlocks(activeInner, itmBase, { activeListingOnly: true }));
 
     if (pageNumber >= totalPages) break;
   }
 
   return all;
-}
-
-async function fetchGetSellerListPages(
-  base: string,
-  token: string,
-  siteId: number,
-  itmBase: string
-): Promise<NormalizedListing[]> {
-  const all: NormalizedListing[] = [];
-  const endFrom = new Date(Date.now() - 2 * 365 * 24 * 60 * 60 * 1000).toISOString();
-  const endTo = new Date(Date.now() + 3 * 365 * 24 * 60 * 60 * 1000).toISOString();
-
-  for (let pageNumber = 1; pageNumber <= 200; pageNumber++) {
-    const body = `<?xml version="1.0" encoding="utf-8"?>
-<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <DetailLevel>ReturnAll</DetailLevel>
-  <GranularityLevel>Fine</GranularityLevel>
-  <EndTimeFrom>${endFrom}</EndTimeFrom>
-  <EndTimeTo>${endTo}</EndTimeTo>
-  <Pagination>
-    <EntriesPerPage>200</EntriesPerPage>
-    <PageNumber>${pageNumber}</PageNumber>
-  </Pagination>
-</GetSellerListRequest>`;
-
-    const xml = await postTradingXml(base, token, siteId, "GetSellerList", body);
-    all.push(
-      ...parseItemsFromItemBlocks(xml, itmBase, {
-        activeListingOnly: true,
-        listingSource: "trading_get_seller_list",
-      })
-    );
-
-    const tp = xml.match(/<TotalNumberOfPages>(\d+)<\/TotalNumberOfPages>/i);
-    const totalPages = tp ? Math.max(1, Number(tp[1])) : 1;
-
-    if (pageNumber >= totalPages) break;
-  }
-
-  return dedupeByItemId(all);
 }
 
 function dedupeByItemId(rows: NormalizedListing[]): NormalizedListing[] {
@@ -259,16 +233,12 @@ export async function fetchAllMyEbayActiveListingsTrading(
   const base = tradingApiBase(opts.sandbox);
   const itmBase = opts.sandbox ? "https://sandbox.ebay.com/itm/" : "https://www.ebay.com/itm/";
 
-  let myebay = await fetchGetMyeBaySellingPages(base, accessToken, opts.siteId, itmBase);
-  myebay = dedupeByItemId(myebay);
-
-  /** Always merge GetSellerList: GUI-only listings are often absent from GetMyeBaySelling when other rows exist. */
-  let sellerList: NormalizedListing[] = [];
-  try {
-    sellerList = await fetchGetSellerListPages(base, accessToken, opts.siteId, itmBase);
-  } catch {
-    /* optional supplement */
-  }
-
-  return dedupeByItemId([...myebay, ...sellerList]);
+  /**
+   * `GetSellerList` is intentionally **not** used: it spans a wide `EndTime` window and returns
+   * ended/inactive listings that Seller Hub shows under “Inactive” / unsold-not-relisted, not
+   * [active inventory](https://www.ebay.com/sh/lst/active). Sell Inventory + offer status is the
+   * source of truth for which SKUs are live; Trading here only supplements URLs/photos via merge.
+   */
+  const myebay = await fetchGetMyeBaySellingPages(base, accessToken, opts.siteId, itmBase);
+  return dedupeByItemId(myebay);
 }

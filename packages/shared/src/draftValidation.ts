@@ -31,6 +31,15 @@ export type EbayShippingDraft = {
   irregularPackage?: boolean | null;
 };
 
+/** Coalesce null/undefined `packageWeightLbs` / `packageWeightOz` to 0 for API payloads and eBay publish. */
+export function ebayShippingForApiPayload(sh: EbayShippingDraft | undefined | null): EbayShippingDraft {
+  return {
+    ...(sh ?? {}),
+    packageWeightLbs: (sh ?? {}).packageWeightLbs ?? 0,
+    packageWeightOz: (sh ?? {}).packageWeightOz ?? 0,
+  };
+}
+
 /** eBay pricing & Best Offer (list price remains `ebay.price`). */
 export type EbayPricingDraft = {
   bestOfferEnabled?: boolean | null;
@@ -101,6 +110,18 @@ function ebayIssues(
   }
   if (!photoIds?.length) {
     out.push({ field: "photos", message: "At least one photo is required for eBay" });
+  }
+
+  const sh = ebayShippingForApiPayload(e.shipping);
+  const lbsW = Number(sh.packageWeightLbs) || 0;
+  const ozW = Number(sh.packageWeightOz) || 0;
+  const totalLb = lbsW + ozW / 16;
+  if (totalLb <= 0) {
+    out.push({
+      field: "ebay.shipping.packageWeight",
+      message:
+        "Add a valid package weight (pounds and/or ounces). eBay requires shipping weight to publish.",
+    });
   }
 
   const pr = e.pricing;

@@ -15,7 +15,7 @@ import {
   type ValidationIssue,
 } from "@inv/shared";
 import { DraftPhotoEditorModal } from "../components/DraftPhotoEditorModal.js";
-import { apiFetch } from "../lib/api.js";
+import { apiFetch, ApiRequestError } from "../lib/api.js";
 import { inventoryItemDisplayName } from "../lib/inventoryDisplay.js";
 import { supabase } from "../lib/supabase.js";
 
@@ -99,6 +99,15 @@ function categoryNameFromAi(p: Record<string, unknown> | undefined): string {
   return typeof raw === "string" ? raw.trim() : "";
 }
 
+/** Clear legacy 0/0 weights saved when nulls were normalized to zero so fields show empty and validation matches intent. */
+function legacyUnsetZeroPackageWeights(sh: EbayShippingDraft | undefined): EbayShippingDraft {
+  if (!sh) return {};
+  if (sh.packageWeightLbs === 0 && sh.packageWeightOz === 0) {
+    return { ...sh, packageWeightLbs: null, packageWeightOz: null };
+  }
+  return sh;
+}
+
 function buildInitialEditor(data: DetailResponse): DraftEditorPayload {
   const ebayRow = data.ebayDraft ?? data.siblings.find((s) => s.platform === "ebay");
   const existing = (ebayRow?.payload?.editor ?? {}) as DraftEditorPayload;
@@ -138,7 +147,7 @@ function buildInitialEditor(data: DetailResponse): DraftEditorPayload {
         sku: existing.ebay?.listing?.sku ?? inv.sku ?? "",
         color: existing.ebay?.listing?.color ?? "",
       },
-      shipping: { ...(existing.ebay?.shipping ?? {}) },
+      shipping: legacyUnsetZeroPackageWeights({ ...(existing.ebay?.shipping ?? {}) }),
       pricing: { ...(existing.ebay?.pricing ?? {}) },
     },
     shopify: {
@@ -218,6 +227,8 @@ export function DraftEditorPage() {
 
   const [editor, setEditor] = useState<DraftEditorPayload | null>(null);
   const [invalid, setInvalid] = useState<Record<string, boolean>>({});
+  /** Shown when publish returns structured failure (e.g. eBay 25020) without throwing. */
+  const [publishFailureMessage, setPublishFailureMessage] = useState<string | null>(null);
   const [publishTargets, setPublishTargets] = useState<Record<string, boolean>>({});
   /** Photo being edited in the modal (replace file at same storage path, same DB row). */
   const [editingPhoto, setEditingPhoto] = useState<{
@@ -402,6 +413,7 @@ export function DraftEditorPage() {
 
   const publishMutation = useMutation({
     mutationFn: async () => {
+      setPublishFailureMessage(null);
       if (!draftId || !editor) throw new Error("Missing data");
       const selected = (["ebay", "shopify", "depop", "poshmark", "mercari"] as const).filter(
         (p) => publishTargets[p]
@@ -429,8 +441,18 @@ export function DraftEditorPage() {
       setInvalid({});
       return apiFetch(`/api/listing-drafts/${draftId}/publish`, {
         method: "POST",
-        body: JSON.stringify({ platforms: selected }),
-      }) as Promise<{ ok: boolean; results?: Record<string, { ok: boolean; message?: string; url?: string }> }>;
+        body: JSON.stringify({
+          platforms: selected,
+          /** Persist latest editor to the eBay draft row before publish (same merge as PATCH). */
+          payload: { ...ebayPayloadBase, editor },
+        }),
+      }) as Promise<{
+        ok: boolean;
+        results?: Record<
+          string,
+          { ok: boolean; message?: string; url?: string; clientField?: string; userMessage?: string }
+        >;
+      }>;
     },
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ["listing-draft-detail", draftId] });
@@ -438,8 +460,43 @@ export function DraftEditorPage() {
       qc.invalidateQueries({ queryKey: ["integrations"] });
       qc.invalidateQueries({ queryKey: ["inventory"] });
       qc.invalidateQueries({ queryKey: ["platform-listings"] });
-      if (data?.ok) {
+      if (!data?.ok || !data.results) return;
+      const results = data.results;
+      const entries = Object.entries(results);
+      const allOk = entries.every(([, v]) => v.ok);
+      const failed = entries.filter(([, v]) => !v.ok);
+      if (failed.length > 0) {
+        const ebay = results.ebay;
+        if (ebay && !ebay.ok) {
+          const cf = ebay.clientField;
+          if (cf) {
+            setInvalid((prev) => ({ ...prev, [cf]: true }));
+            setTimeout(() => scrollToFirstError(cf), 0);
+          }
+          setPublishFailureMessage(ebay.userMessage ?? ebay.message ?? "eBay publish failed.");
+        } else {
+          const firstMsg = failed.map(([, v]) => v.message).find(Boolean);
+          setPublishFailureMessage(firstMsg ?? "Publish failed.");
+        }
+      } else {
+        setPublishFailureMessage(null);
+      }
+      if (allOk) {
         navigate("/drafts", { replace: true });
+      }
+    },
+    onError: (err) => {
+      if (err instanceof ApiRequestError && err.status === 502) {
+        const body = err.body as {
+          results?: { ebay?: { clientField?: string; userMessage?: string; message?: string } };
+        };
+        const ebay = body.results?.ebay;
+        const cf = ebay?.clientField;
+        if (cf) {
+          setInvalid((prev) => ({ ...prev, [cf]: true }));
+          setTimeout(() => scrollToFirstError(cf), 0);
+        }
+        setPublishFailureMessage(ebay?.userMessage ?? ebay?.message ?? err.message);
       }
     },
   });
@@ -472,6 +529,17 @@ export function DraftEditorPage() {
   }
 
   function updateEbayShipping(patch: Partial<EbayShippingDraft>) {
+    if (
+      ("packageWeightLbs" in patch || "packageWeightOz" in patch) &&
+      invalid["ebay.shipping.packageWeight"]
+    ) {
+      setPublishFailureMessage(null);
+      setInvalid((prev) => {
+        const next = { ...prev };
+        delete next["ebay.shipping.packageWeight"];
+        return next;
+      });
+    }
     setEditor((e) => {
       if (!e?.ebay) return e;
       return {
@@ -636,6 +704,31 @@ export function DraftEditorPage() {
     }
   }
 
+  const shippingSectionError = useMemo(() => {
+    const msg =
+      publishFailureMessage ??
+      (publishMutation.isError ? (publishMutation.error as Error)?.message : undefined) ??
+      (saveMutation.isError ? (saveMutation.error as Error)?.message : undefined) ??
+      null;
+    if (!msg) return null;
+    const isShipping =
+      /\bpackage weight\b/i.test(msg) ||
+      /\bshipping weight\b/i.test(msg) ||
+      /weight.*publish/i.test(msg) ||
+      /\b25020\b/.test(msg) ||
+      /^Add a valid package weight/i.test(msg.trim());
+    return isShipping ? msg : null;
+  }, [
+    publishFailureMessage,
+    publishMutation.isError,
+    publishMutation.error,
+    saveMutation.isError,
+    saveMutation.error,
+  ]);
+
+  const showTopFormError =
+    (saveMutation.isError || publishMutation.isError || publishFailureMessage) && !shippingSectionError;
+
   if (isLoading || !data) {
     return (
       <div>
@@ -732,9 +825,11 @@ export function DraftEditorPage() {
         · Qty {data.inventoryItem.quantity_available}
       </p>
 
-      {(saveMutation.isError || publishMutation.isError) && (
+      {showTopFormError && (
         <p className="error" role="alert">
-          {(saveMutation.error as Error)?.message ?? (publishMutation.error as Error)?.message}
+          {publishFailureMessage ??
+            (saveMutation.error as Error)?.message ??
+            (publishMutation.error as Error)?.message}
         </p>
       )}
 
@@ -1146,9 +1241,25 @@ export function DraftEditorPage() {
           </label>
         </div>
 
-        <h3 style={{ marginTop: "1.25rem", marginBottom: "0.5rem" }}>Shipping (eBay)</h3>
+        <div
+          data-field="ebay.shipping.packageWeight"
+          style={{
+            marginTop: "1.25rem",
+            padding: "0.75rem",
+            borderRadius: 8,
+            border: invalid["ebay.shipping.packageWeight"] ? "2px solid #b91c1c" : "1px solid transparent",
+            background: invalid["ebay.shipping.packageWeight"] ? "#fef2f2" : undefined,
+          }}
+        >
+        <h3 style={{ marginTop: 0, marginBottom: "0.5rem" }}>Shipping (eBay)</h3>
+        {shippingSectionError && (
+          <p className="error" role="alert" style={{ marginTop: 0, marginBottom: "0.5rem" }}>
+            {shippingSectionError}
+          </p>
+        )}
         <p style={{ marginTop: 0, fontSize: "0.85rem", color: "#64748b" }}>
           Uses your eBay business policies. Leave blank to use the first policy from your account for each type.
+          Package weight is required for eBay to accept the listing.
         </p>
         <div style={{ display: "grid", gap: "0.75rem", maxWidth: 560 }}>
           <label>
@@ -1301,6 +1412,7 @@ export function DraftEditorPage() {
               ))}
             </select>
           </label>
+        </div>
         </div>
 
         <h3 style={{ marginTop: "1.25rem", marginBottom: "0.5rem" }}>Pricing (eBay)</h3>

@@ -77,7 +77,7 @@ export async function registerAiRoutes(app: FastifyInstance, env: Env) {
 
     const { data: item, error: itemErr } = await service
       .from("inventory_items")
-      .select("id, user_id, draft_ai_status")
+      .select("id, user_id, draft_ai_status, status")
       .eq("id", inventoryItemId)
       .eq("user_id", auth.user.id)
       .maybeSingle();
@@ -86,6 +86,9 @@ export async function registerAiRoutes(app: FastifyInstance, env: Env) {
     }
     if (!item) {
       return reply.status(404).send({ error: "Item not found" });
+    }
+    if (item.status !== "active") {
+      return reply.status(400).send({ error: "Inventory item is not active" });
     }
 
     if (item.draft_ai_status === "pending") {

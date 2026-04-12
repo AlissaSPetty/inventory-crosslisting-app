@@ -57,7 +57,10 @@ function userFacingInventorySku(sku: string | null | undefined): string | null {
 type SyncAllPlatformResult = {
   platform: string;
   status: "ok" | "skipped";
+  /** Live listings in app after sync (`active` | `pending_link` on `platform_listings`). */
   importedOrUpdated?: number;
+  /** Listing snapshots processed from each marketplace API this run (may differ from `importedOrUpdated`). */
+  listingsProcessedFromApi?: number;
   message?: string;
 };
 
@@ -67,7 +70,12 @@ function formatSyncAllSummary(platforms: SyncAllPlatformResult[]): string {
       const label = ACTIVE_PLATFORM_LABEL[p.platform] ?? p.platform;
       if (p.status === "ok") {
         const n = p.importedOrUpdated ?? 0;
-        return `${label}: ${n} listing${n === 1 ? "" : "s"} pulled`;
+        const processed = p.listingsProcessedFromApi;
+        const base = `${label}: ${n} active listing${n === 1 ? "" : "s"} in app`;
+        if (typeof processed === "number" && processed !== n) {
+          return `${base} (${processed} processed from API this run)`;
+        }
+        return base;
       }
       const msg = p.message?.length ? (p.message.length > 72 ? `${p.message.slice(0, 69)}…` : p.message) : "skipped";
       return `${label}: ${msg}`;
@@ -146,7 +154,8 @@ export function InventoryPage() {
         ok: boolean;
         platforms: SyncAllPlatformResult[];
       }>,
-    onSuccess: () => {
+    onSuccess: (data) => {
+      console.log("[Refresh inventory] POST /api/sync/all response:", data);
       qc.invalidateQueries({ queryKey: ["platform-listings", "live"] });
     },
   });

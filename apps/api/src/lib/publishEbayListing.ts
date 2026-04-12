@@ -7,6 +7,20 @@ import { localeForEbayMarketplace } from "./ebayLocale.js";
 const EBAY_API = (sandbox: boolean) =>
   sandbox ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
 
+/** eBay 25001 / 25003: Core Inventory Service internal — often transient; safe to retry publish. */
+function isEbayTransientInventoryCoreError(status: number, body: string): boolean {
+  if (status !== 500 && status !== 503) return false;
+  try {
+    const parsed = JSON.parse(body) as { errors?: { errorId?: number }[] };
+    return (parsed.errors ?? []).some((e) => e.errorId === 25001 || e.errorId === 25003);
+  } catch {
+    return false;
+  }
+}
+
+const OFFER_PUBLISH_MAX_ATTEMPTS = 3;
+const OFFER_PUBLISH_RETRY_DELAY_MS = 900;
+
 /** eBay error 25002 includes `offerId` in parameters when createOffer races an existing offer. */
 function tryParseOfferIdFromDuplicateError(body: string): string | null {
   try {
@@ -151,7 +165,7 @@ export async function publishToEbay(
   if (pkg && pkg.weightPounds > 0) {
     const pws: Record<string, unknown> = {
       weight: {
-        value: Number(pkg.weightPounds.toFixed(4)).toString(),
+        value: Number(pkg.weightPounds.toFixed(4)),
         unit: "POUND",
       },
     };
@@ -310,13 +324,33 @@ export async function publishToEbay(
     }
   }
 
-  const pub = await fetch(`${base}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}/publish`, {
-    method: "POST",
-    headers: commonHeaders,
-  });
-  if (!pub.ok) {
-    throw new Error(`eBay publish: ${pub.status} ${await pub.text()}`);
+  const publishUrl = `${base}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}/publish`;
+  let lastStatus = 0;
+  let lastBody = "";
+  let pubJson: { listingId?: string } = {};
+  for (let attempt = 1; attempt <= OFFER_PUBLISH_MAX_ATTEMPTS; attempt++) {
+    const pub = await fetch(publishUrl, {
+      method: "POST",
+      headers: commonHeaders,
+    });
+    lastBody = await pub.text();
+    lastStatus = pub.status;
+    if (pub.ok) {
+      try {
+        pubJson = JSON.parse(lastBody) as { listingId?: string };
+      } catch {
+        pubJson = {};
+      }
+      break;
+    }
+    if (
+      attempt < OFFER_PUBLISH_MAX_ATTEMPTS &&
+      isEbayTransientInventoryCoreError(pub.status, lastBody)
+    ) {
+      await new Promise((r) => setTimeout(r, OFFER_PUBLISH_RETRY_DELAY_MS * attempt));
+      continue;
+    }
+    throw new Error(`eBay publish: ${lastStatus} ${lastBody}`);
   }
-  const pubJson = (await pub.json()) as { listingId?: string };
   return { offerId, listingId: pubJson.listingId };
 }

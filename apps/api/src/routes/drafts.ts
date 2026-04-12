@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { PLATFORMS } from "@inv/shared";
 import {
+  ebayShippingForApiPayload,
   normalizeEbayConditionForInventory,
   validateDraftEditor,
   type DraftEditorPayload,
@@ -27,6 +28,24 @@ function ebayAspectsFromListing(listing: { itemAspects?: Record<string, string> 
     if (key && val) out[key] = [val];
   }
   return Object.keys(out).length ? out : undefined;
+}
+
+/** Map known eBay Inventory JSON errors to UI hints (see Sell Inventory error catalogs). */
+function ebayPublishFailureExtras(message: string): { clientField?: string; userMessage?: string } {
+  if (/"errorId"\s*:\s*25020\b/.test(message)) {
+    return {
+      clientField: "ebay.shipping.packageWeight",
+      userMessage:
+        "Add a valid package weight (pounds and/or ounces) under Shipping (eBay). eBay requires package weight to publish this listing.",
+    };
+  }
+  if (/"errorId"\s*:\s*25001\b/.test(message) || /"errorId"\s*:\s*25003\b/.test(message)) {
+    return {
+      userMessage:
+        "eBay’s inventory service returned a temporary error while publishing. Try again in a few minutes. If it keeps failing, check Seller Hub or try later—the issue is usually on eBay’s side, not your draft.",
+    };
+  }
+  return {};
 }
 
 function mergeListingDraftPayload(
@@ -135,8 +154,9 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
     let query = auth.supabase
       .from("listing_drafts")
       .select(
-        "id, user_id, inventory_item_id, platform, payload, version, published_listing_id, created_at, updated_at, inventory_items ( title, sku, draft_ai_status, inventory_images ( id, storage_path, sort_order, file_updated_at ) )"
+        "id, user_id, inventory_item_id, platform, payload, version, published_listing_id, created_at, updated_at, inventory_items!inner ( title, sku, draft_ai_status, inventory_images ( id, storage_path, sort_order, file_updated_at ) )"
       )
+      .eq("inventory_items.status", "active")
       .order("updated_at", { ascending: false });
     const unpublishedOnly = (req.query as { unpublished_only?: string }).unpublished_only;
     if (unpublishedOnly === "true" || unpublishedOnly === "1") {
@@ -196,7 +216,7 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
     const auth = await requireAuth(req, reply, env);
     if (!auth) return;
     const id = (req.params as { id: string }).id;
-    const body = req.body as { platforms?: string[] };
+    const body = req.body as { platforms?: string[]; payload?: Record<string, unknown> };
     const platforms = (body.platforms ?? []).filter((p): p is Platform =>
       PLATFORMS.includes(p as Platform)
     );
@@ -217,12 +237,26 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
 
     const { data: ebayRow, error: e2 } = await auth.supabase
       .from("listing_drafts")
-      .select("payload")
+      .select("id, payload")
       .eq("inventory_item_id", iid)
       .eq("platform", "ebay")
       .maybeSingle();
     if (e2) return reply.status(500).send({ error: e2.message });
-    const editor = (ebayRow?.payload as { editor?: DraftEditorPayload } | undefined)?.editor;
+    if (!ebayRow) {
+      return reply.status(404).send({ error: "eBay draft row missing for this item" });
+    }
+
+    let ebayPayload = (ebayRow.payload ?? {}) as Record<string, unknown>;
+    if (body.payload && typeof body.payload === "object") {
+      ebayPayload = mergeListingDraftPayload(ebayPayload, body.payload);
+      const { error: saveErr } = await auth.supabase
+        .from("listing_drafts")
+        .update({ payload: ebayPayload, updated_at: new Date().toISOString() })
+        .eq("id", ebayRow.id);
+      if (saveErr) return reply.status(500).send({ error: saveErr.message });
+    }
+
+    const editor = (ebayPayload as { editor?: DraftEditorPayload }).editor;
 
     let ebayRequiredAspectNames: string[] | undefined;
     if (platforms.includes("ebay") && env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) {
@@ -306,13 +340,13 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
         if (eb.listing?.color?.trim()) {
           description = `Color: ${eb.listing.color.trim()}\n\n${description}`;
         }
-        const sh = eb.shipping;
-        const lbs = Number(sh?.packageWeightLbs ?? 0) || 0;
-        const oz = Number(sh?.packageWeightOz ?? 0) || 0;
+        const w = ebayShippingForApiPayload(eb.shipping);
+        const lbs = Number(w.packageWeightLbs) || 0;
+        const oz = Number(w.packageWeightOz) || 0;
         const totalLb = lbs + oz / 16;
-        const len = sh?.packageLengthIn;
-        const wid = sh?.packageWidthIn;
-        const hgt = sh?.packageHeightIn;
+        const len = w.packageLengthIn;
+        const wid = w.packageWidthIn;
+        const hgt = w.packageHeightIn;
         const hasDims =
           len != null &&
           wid != null &&
@@ -327,7 +361,7 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
                 lengthIn: hasDims ? Number(len) : undefined,
                 widthIn: hasDims ? Number(wid) : undefined,
                 heightIn: hasDims ? Number(hgt) : undefined,
-                shippingIrregular: sh?.irregularPackage === true,
+                shippingIrregular: w.irregularPackage === true,
               }
             : undefined;
         const pr = eb.pricing;
@@ -356,9 +390,9 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
             condition: normalizeEbayConditionForInventory(eb.condition ?? "") || "NEW",
             categoryId: eb.categoryId?.trim() || env.EBAY_DEFAULT_CATEGORY_ID,
             marketplaceId: env.EBAY_MARKETPLACE_ID,
-            fulfillmentPolicyId: sh?.fulfillmentPolicyId,
-            paymentPolicyId: sh?.paymentPolicyId,
-            returnPolicyId: sh?.returnPolicyId,
+            fulfillmentPolicyId: w.fulfillmentPolicyId,
+            paymentPolicyId: w.paymentPolicyId,
+            returnPolicyId: w.returnPolicyId,
             bestOffer,
             packageWeightAndSize,
             aspects: ebayAspectsFromListing(eb.listing),
@@ -407,7 +441,8 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           req.log.warn({ err }, `eBay publish failed: ${message}`);
-          results.ebay = { ok: false, message };
+          const extras = ebayPublishFailureExtras(message);
+          results.ebay = { ok: false, message, ...extras };
         }
         continue;
       }

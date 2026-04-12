@@ -14,6 +14,17 @@ export type NormalizedListing = {
   metadata?: Record<string, unknown>;
 };
 
+/** Payload returned by `fetchActiveListings` when `ok: true`. */
+export type FetchActiveListingsData = {
+  listings: NormalizedListing[];
+  nextCursor?: string;
+  /**
+   * eBay: number of `inventory_item` rows on this page from `getInventoryItems` (before live-offer filter).
+   * Sync uses this to avoid pruning when the API returns an empty inventory snapshot (e.g. sandbox vs production mismatch).
+   */
+  ebayInventorySkusThisPage?: number;
+};
+
 export type AdapterResult<T> =
   | { ok: true; data: T }
   | { ok: false; code: "manual_required" | "blocked" | "error"; message: string };
@@ -23,7 +34,7 @@ export interface PlatformAdapter {
   fetchActiveListings(
     credentials: unknown,
     cursor?: string
-  ): Promise<AdapterResult<{ listings: NormalizedListing[]; nextCursor?: string }>>;
+  ): Promise<AdapterResult<FetchActiveListingsData>>;
   setInventoryQuantity(
     credentials: unknown,
     externalListingId: string,

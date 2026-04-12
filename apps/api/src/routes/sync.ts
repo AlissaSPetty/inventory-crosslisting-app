@@ -113,10 +113,10 @@ const INVENTORY_FETCH_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 /**
  * Remove `platform_listings` that are absent from the latest marketplace snapshot.
  *
- * - **`sync_fetch`**: Rows we only mirror from the platform API — if not returned this run, delete
- *   regardless of `status` (ended, duplicate, or stale mirror data).
- * - **`app`**: Published-from-app rows — only prune when still marked live (`active` / `pending_link`)
- *   but no longer returned as active (listing ended/delisted off-platform).
+ * - **`sync_fetch`**: Mirror rows — if not returned this run, delete (ended / stale import).
+ * - **`app`**: **Not pruned here.** Deleting an app row triggers `listing_drafts.published_listing_id`
+ *   → `SET NULL`, which puts published items back on the drafts list. Matching can fail when the
+ *   Inventory API omits SKUs (env mismatch) or offer payloads differ; updates still merge when matched.
  * - **`manual_link`**: Never removed here (not API-authoritative).
  */
 async function prunePlatformListingsAfterFetch(
@@ -125,15 +125,6 @@ async function prunePlatformListingsAfterFetch(
   platform: Platform,
   touchedListingIds: Set<string>
 ): Promise<{ ok: true } | { ok: false; message: string }> {
-  const { data: appLive, error: e1 } = await service
-    .from("platform_listings")
-    .select("id")
-    .eq("user_id", userId)
-    .eq("platform", platform)
-    .eq("source", "app")
-    .in("status", ["active", "pending_link"]);
-  if (e1) return { ok: false, message: e1.message };
-
   const { data: syncMirror, error: e2 } = await service
     .from("platform_listings")
     .select("id")
@@ -143,9 +134,6 @@ async function prunePlatformListingsAfterFetch(
   if (e2) return { ok: false, message: e2.message };
 
   const staleIds = new Set<string>();
-  for (const r of appLive ?? []) {
-    if (!touchedListingIds.has(r.id)) staleIds.add(r.id);
-  }
   for (const r of syncMirror ?? []) {
     if (!touchedListingIds.has(r.id)) staleIds.add(r.id);
   }
@@ -168,7 +156,18 @@ async function trimOldInventoryFetchSyncEvents(service: SupabaseClient, userId: 
 }
 
 type SyncListingsResult =
-  | { status: "synced"; importedOrUpdated: number }
+  | {
+      status: "synced";
+      /** Live `platform_listings` for this platform after sync+prune (`active` | `pending_link`). */
+      importedOrUpdated: number;
+      /** Listing snapshots processed from the marketplace API this run (loop counter). */
+      listingsProcessedFromApi: number;
+      /** eBay: total `inventory_item` rows seen from `getInventoryItems` (all pages). */
+      ebayInventorySkusFromApi?: number;
+      /** eBay: prune skipped because API returned zero inventory SKUs (protects rows from env mismatch). */
+      ebayPruneSkipped?: boolean;
+      ebayHint?: string;
+    }
   | { status: "failed"; message: string; code?: string };
 
 async function executePlatformListingsSync(
@@ -209,6 +208,7 @@ async function executePlatformListingsSync(
 
   let cursor: string | undefined;
   let total = 0;
+  let ebayInventorySkusFromApi = 0;
   /** DB row ids matched or created from this pull — everything else mirror-sourced is eligible for prune. */
   const touchedListingIds = new Set<string>();
   do {
@@ -232,6 +232,9 @@ async function executePlatformListingsSync(
     }
     if (!res.ok) {
       return { status: "failed", message: res.message, code: res.code };
+    }
+    if (platform === "ebay") {
+      ebayInventorySkusFromApi += res.data.ebayInventorySkusThisPage ?? 0;
     }
     for (const listing of res.data.listings) {
       let existing: { id: string; source?: string } | null = null;
@@ -330,9 +333,23 @@ async function executePlatformListingsSync(
     cursor = res.data.nextCursor;
   } while (cursor);
 
-  const pruneRes = await prunePlatformListingsAfterFetch(service, userId, platform, touchedListingIds);
-  if (!pruneRes.ok) {
-    return { status: "failed", message: pruneRes.message };
+  /** Empty `getInventoryItems` is often sandbox vs production token mismatch — do not delete DB rows. */
+  const skipEbayPrune = platform === "ebay" && ebayInventorySkusFromApi === 0;
+  if (!skipEbayPrune) {
+    const pruneRes = await prunePlatformListingsAfterFetch(service, userId, platform, touchedListingIds);
+    if (!pruneRes.ok) {
+      return { status: "failed", message: pruneRes.message };
+    }
+  }
+
+  const { count: liveCount, error: liveCountErr } = await service
+    .from("platform_listings")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("platform", platform)
+    .in("status", ["active", "pending_link"]);
+  if (liveCountErr) {
+    return { status: "failed", message: liveCountErr.message };
   }
 
   await trimOldInventoryFetchSyncEvents(service, userId);
@@ -340,9 +357,25 @@ async function executePlatformListingsSync(
   await service.from("sync_events").insert({
     user_id: userId,
     event_type: "inventory_fetch_completed",
-    payload: { platform, count: total },
+    payload: { platform, listingsProcessedFromApi: total, liveListingsInApp: liveCount ?? 0 },
   });
-  return { status: "synced", importedOrUpdated: total };
+  return {
+    status: "synced",
+    importedOrUpdated: liveCount ?? 0,
+    listingsProcessedFromApi: total,
+    ...(platform === "ebay"
+      ? {
+          ebayInventorySkusFromApi,
+          ...(skipEbayPrune
+            ? {
+                ebayPruneSkipped: true,
+                ebayHint:
+                  "eBay returned zero inventory SKUs for this access token. If you publish on production eBay, set EBAY_SANDBOX=false, restart the API, and reconnect under Integrations. Listing rows were not pruned.",
+              }
+            : {}),
+        }
+      : {}),
+  };
 }
 
 export async function registerSyncRoutes(app: FastifyInstance, env: Env) {
@@ -362,13 +395,27 @@ export async function registerSyncRoutes(app: FastifyInstance, env: Env) {
       platform: string;
       status: "ok" | "skipped";
       importedOrUpdated?: number;
+      listingsProcessedFromApi?: number;
+      ebayInventorySkusFromApi?: number;
+      ebayPruneSkipped?: boolean;
+      ebayHint?: string;
       message?: string;
       code?: string;
     }> = [];
     for (const platform of platforms) {
       const result = await executePlatformListingsSync(env, auth.user.id, platform);
       if (result.status === "synced") {
-        results.push({ platform, status: "ok", importedOrUpdated: result.importedOrUpdated });
+        results.push({
+          platform,
+          status: "ok",
+          importedOrUpdated: result.importedOrUpdated,
+          listingsProcessedFromApi: result.listingsProcessedFromApi,
+          ...(result.ebayInventorySkusFromApi != null
+            ? { ebayInventorySkusFromApi: result.ebayInventorySkusFromApi }
+            : {}),
+          ...(result.ebayPruneSkipped ? { ebayPruneSkipped: result.ebayPruneSkipped } : {}),
+          ...(result.ebayHint ? { ebayHint: result.ebayHint } : {}),
+        });
       } else {
         results.push({
           platform,
@@ -392,6 +439,15 @@ export async function registerSyncRoutes(app: FastifyInstance, env: Env) {
       }
       return reply.status(502).send({ error: result.message, code: result.code });
     }
-    return { ok: true, importedOrUpdated: result.importedOrUpdated };
+    return {
+      ok: true,
+      importedOrUpdated: result.importedOrUpdated,
+      listingsProcessedFromApi: result.listingsProcessedFromApi,
+      ...(result.ebayInventorySkusFromApi != null
+        ? { ebayInventorySkusFromApi: result.ebayInventorySkusFromApi }
+        : {}),
+      ...(result.ebayPruneSkipped ? { ebayPruneSkipped: result.ebayPruneSkipped } : {}),
+      ...(result.ebayHint ? { ebayHint: result.ebayHint } : {}),
+    };
   });
 }

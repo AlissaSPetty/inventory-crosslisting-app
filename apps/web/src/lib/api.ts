@@ -1,5 +1,18 @@
 import { supabase } from "./supabase.js";
 
+/** Failed `fetch`; `body` holds JSON when the server returned parseable error payload (e.g. `results` on 502). */
+export class ApiRequestError extends Error {
+  readonly status: number;
+  readonly body: unknown;
+
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.body = body;
+  }
+}
+
 export async function apiFetch(path: string, init?: RequestInit) {
   const { data: session } = await supabase.auth.getSession();
   const token = session.session?.access_token;
@@ -13,8 +26,12 @@ export async function apiFetch(path: string, init?: RequestInit) {
   }
   const res = await fetch(path, { ...init, headers });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error((err as { error?: string }).error ?? res.statusText);
+    const body = await res.json().catch(() => ({}));
+    const message =
+      typeof (body as { error?: string }).error === "string"
+        ? (body as { error: string }).error
+        : res.statusText;
+    throw new ApiRequestError(message, res.status, body);
   }
   const text = await res.text();
   if (!text.trim()) return undefined;

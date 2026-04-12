@@ -1,4 +1,9 @@
-import type { PlatformAdapter, AdapterResult, NormalizedListing } from "./types.js";
+import type {
+  PlatformAdapter,
+  AdapterResult,
+  FetchActiveListingsData,
+  NormalizedListing,
+} from "./types.js";
 
 type ShopifyCreds = {
   accessToken: string;
@@ -25,14 +30,19 @@ export function createShopifyAdapter(): PlatformAdapter {
   return {
     platform: "shopify",
     async fetchActiveListings(credentials: unknown, cursor?: string): Promise<
-      AdapterResult<{ listings: NormalizedListing[]; nextCursor?: string }>
+      AdapterResult<FetchActiveListingsData>
     > {
       const creds = credentials as ShopifyCreds;
       if (!creds?.accessToken || !creds.shopDomain) {
         return { ok: false, code: "error", message: "Missing Shopify session" };
       }
       const page = cursor ? JSON.parse(cursor) as { page: string } : { page: "1" };
-      const pageInfo = new URLSearchParams({ limit: "50", page: page.page });
+      const pageInfo = new URLSearchParams({
+        limit: "50",
+        page: page.page,
+        /** Draft/archived products are not for sale on the storefront. */
+        status: "active",
+      });
       const res = await rest(creds.shopDomain, creds.accessToken, `/products.json?${pageInfo}`);
       if (!res.ok) {
         return { ok: false, code: "error", message: await res.text() };
