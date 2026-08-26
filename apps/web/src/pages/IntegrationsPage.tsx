@@ -231,6 +231,19 @@ export function IntegrationsPage() {
               opacity: enabled ? 1 : 0.45,
               cursor: enabled ? "pointer" : "not-allowed",
             } as const;
+            // Poshmark/Mercari have no API — send sellers to the Hybrid manual workspace.
+            if (p === "poshmark" || p === "mercari") {
+              return (
+                <Link
+                  key={p}
+                  to="/hybrid"
+                  title="List manually — copy AI draft copy and record the listing"
+                  style={{ textDecoration: "none", display: "inline-block" }}
+                >
+                  {`List manually · ${label}`}
+                </Link>
+              );
+            }
             if (enabled) {
               return (
                 <Link

@@ -1,4 +1,5 @@
 import type { FastifyInstance } from "fastify";
+import { z } from "zod";
 import { PLATFORMS } from "@inv/shared";
 import {
   ebayShippingForApiPayload,
@@ -518,5 +519,105 @@ export async function registerDraftRoutes(app: FastifyInstance, env: Env) {
       return reply.status(502).send({ error: "Publish failed for all platforms", results });
     }
     return { ok: true, results };
+  });
+
+  /**
+   * Hybrid (Poshmark/Mercari) "mark as listed": the seller posted the item on the marketplace
+   * by hand, then records the resulting URL/id here. Mirrors the eBay/Shopify publish tail —
+   * insert a `platform_listings` row (`source:'manual_link'`) and link the platform's draft via
+   * `published_listing_id` so it leaves /hybrid drafts and shows under Active listings.
+   */
+  const markListedBody = z.object({
+    platform: z.enum(["poshmark", "mercari"]),
+    listing_url: z.string().min(1),
+    external_listing_id: z.string().optional(),
+    listed_quantity: z.number().int().min(0).optional(),
+  });
+
+  app.post("/api/listing-drafts/:id/mark-listed", async (req, reply) => {
+    const auth = await requireAuth(req, reply, env);
+    if (!auth) return;
+    const id = (req.params as { id: string }).id;
+    const parsed = markListedBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    const { platform, listing_url, external_listing_id, listed_quantity } = parsed.data;
+
+    const { data: anchor, error: e1 } = await auth.supabase
+      .from("listing_drafts")
+      .select("id, user_id, inventory_item_id")
+      .eq("id", id)
+      .maybeSingle();
+    if (e1) return reply.status(500).send({ error: e1.message });
+    if (!anchor || anchor.user_id !== auth.user.id) {
+      return reply.status(404).send({ error: "Draft not found" });
+    }
+    const iid = anchor.inventory_item_id as string;
+
+    // The draft row for THIS platform + item is what we link and pull the title from.
+    const { data: platformDraft, error: e2 } = await auth.supabase
+      .from("listing_drafts")
+      .select("id, payload")
+      .eq("inventory_item_id", iid)
+      .eq("platform", platform)
+      .maybeSingle();
+    if (e2) return reply.status(500).send({ error: e2.message });
+
+    const { data: item } = await auth.supabase
+      .from("inventory_items")
+      .select("title")
+      .eq("id", iid)
+      .maybeSingle();
+
+    const payload = (platformDraft?.payload ?? {}) as Record<string, unknown>;
+    const draftTitle =
+      typeof payload.title === "string" && payload.title.trim() ? payload.title.trim() : null;
+    const listingTitle = draftTitle ?? item?.title ?? null;
+
+    // First photo (by sort_order) as the listing image, if any.
+    const { data: photos } = await auth.supabase
+      .from("inventory_images")
+      .select("storage_path")
+      .eq("inventory_item_id", iid)
+      .order("sort_order")
+      .limit(1);
+    let listingImageUrl: string | null = null;
+    const firstPath = photos?.[0]?.storage_path;
+    if (typeof firstPath === "string" && firstPath.length) {
+      const base = `${env.SUPABASE_URL.replace(/\/$/, "")}/storage/v1/object/public/listing-photos`;
+      const encoded = firstPath.split("/").map((s) => encodeURIComponent(s)).join("/");
+      listingImageUrl = `${base}/${encoded}`;
+    }
+
+    const { data: listing, error: e3 } = await auth.supabase
+      .from("platform_listings")
+      .insert({
+        user_id: auth.user.id,
+        inventory_item_id: iid,
+        platform,
+        external_listing_id: external_listing_id ?? null,
+        listing_url,
+        listing_title: listingTitle,
+        listing_image_url: listingImageUrl,
+        status: "active",
+        listed_quantity: listed_quantity ?? 1,
+        listed_at: new Date().toISOString(),
+        source: "manual_link",
+        metadata: {},
+      })
+      .select()
+      .single();
+    if (e3) return reply.status(500).send({ error: e3.message });
+
+    if (platformDraft?.id) {
+      await auth.supabase
+        .from("listing_drafts")
+        .update({ published_listing_id: listing.id, updated_at: new Date().toISOString() })
+        .eq("id", platformDraft.id)
+        .eq("user_id", auth.user.id);
+    }
+
+    return { ok: true, listing };
   });
 }

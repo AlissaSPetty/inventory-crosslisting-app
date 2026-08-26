@@ -17,6 +17,17 @@ const listingBody = z.object({
   source: z.enum(["app", "sync_fetch", "manual_link"]).default("app"),
 });
 
+/** Edits to a manual (`source='manual_link'`) row only — never app/sync_fetch rows. */
+const listingPatchBody = z.object({
+  listing_url: z.string().optional(),
+  external_listing_id: z.string().nullable().optional(),
+  listed_quantity: z.number().int().min(0).optional(),
+  status: z.enum(["active", "ended"]).optional(),
+  metadata: z.record(z.unknown()).optional(),
+  listing_title: z.string().optional(),
+  listing_image_url: z.string().optional(),
+});
+
 export async function registerPlatformRoutes(app: FastifyInstance, env: Env) {
   app.get("/api/platform-listings", async (req, reply) => {
     const auth = await requireAuth(req, reply, env);
@@ -71,5 +82,53 @@ export async function registerPlatformRoutes(app: FastifyInstance, env: Env) {
       .single();
     if (error) return reply.status(500).send({ error: error.message });
     return { listing: data };
+  });
+
+  app.patch("/api/platform-listings/:id", async (req, reply) => {
+    const auth = await requireAuth(req, reply, env);
+    if (!auth) return;
+    const id = (req.params as { id: string }).id;
+    const parsed = listingPatchBody.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    const updates: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(parsed.data)) {
+      if (v !== undefined) updates[k] = v;
+    }
+    if (Object.keys(updates).length === 0) {
+      return reply.status(400).send({ error: "No fields to update" });
+    }
+    updates.updated_at = new Date().toISOString();
+    const { data, error } = await auth.supabase
+      .from("platform_listings")
+      .update(updates)
+      .eq("id", id)
+      .eq("user_id", auth.user.id)
+      .eq("source", "manual_link")
+      .select()
+      .maybeSingle();
+    if (error) return reply.status(500).send({ error: error.message });
+    if (!data) return reply.status(404).send({ error: "Manual listing not found" });
+    return { listing: data };
+  });
+
+  app.delete("/api/platform-listings/:id", async (req, reply) => {
+    const auth = await requireAuth(req, reply, env);
+    if (!auth) return;
+    const id = (req.params as { id: string }).id;
+    // FK `listing_drafts.published_listing_id → platform_listings(id) ON DELETE SET NULL`
+    // re-surfaces the linked draft under /hybrid after removal.
+    const { data, error } = await auth.supabase
+      .from("platform_listings")
+      .delete()
+      .eq("id", id)
+      .eq("user_id", auth.user.id)
+      .eq("source", "manual_link")
+      .select("id")
+      .maybeSingle();
+    if (error) return reply.status(500).send({ error: error.message });
+    if (!data) return reply.status(404).send({ error: "Manual listing not found" });
+    return { ok: true };
   });
 }

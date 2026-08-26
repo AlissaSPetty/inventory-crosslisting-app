@@ -71,7 +71,7 @@ export async function propagateSaleQuantity(
 
   const { data: others, error: oErr } = await service
     .from("platform_listings")
-    .select("id, platform, external_listing_id, listed_quantity, shop_domain")
+    .select("id, platform, external_listing_id, listed_quantity, shop_domain, listing_url, source")
     .eq("user_id", userId)
     .eq("inventory_item_id", inv.id)
     .neq("id", soldRow.id);
@@ -81,6 +81,31 @@ export async function propagateSaleQuantity(
   for (const pl of others ?? []) {
     const platform = pl.platform as Platform;
     const adapter = adapters[platform];
+    const targetQty = quantityToApplyOnOtherListings(next, pl.listed_quantity ?? 0);
+
+    /** Emit a distinct, user-facing to-do (delist / adjust qty by hand). */
+    const writeManualAction = () =>
+      service.from("sync_events").insert({
+        user_id: userId,
+        inventory_item_id: inv.id,
+        platform,
+        event_type: "manual_action_required",
+        payload: {
+          platformListingId: pl.id,
+          platform,
+          inventory_item_id: inv.id,
+          targetQty,
+          listing_url: pl.listing_url ?? null,
+          reason: "hybrid_platform",
+        },
+      });
+
+    // Hybrid/manual rows (Poshmark/Mercari): no API to call — always a manual to-do.
+    if (pl.source === "manual_link") {
+      await writeManualAction();
+      continue;
+    }
+
     const { data: credRow } = await service
       .from("integration_credentials")
       .select("encrypted_payload, shop_domain")
@@ -98,10 +123,14 @@ export async function propagateSaleQuantity(
       continue;
     }
     const creds = decryptPayload(env, credRow.encrypted_payload);
-    const targetQty = quantityToApplyOnOtherListings(next, pl.listed_quantity ?? 0);
     const res = await adapter.setInventoryQuantity(creds, pl.external_listing_id, targetQty, {
       shopDomain: credRow.shop_domain ?? pl.shop_domain ?? undefined,
     });
+    // Adapter can't automate (e.g. hybrid adapter) — surface a manual to-do, not an error.
+    if (!res.ok && res.code === "manual_required") {
+      await writeManualAction();
+      continue;
+    }
     await service.from("sync_events").insert({
       user_id: userId,
       inventory_item_id: inv.id,
