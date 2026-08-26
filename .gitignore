@@ -23,3 +23,6 @@ supabase/.temp/
 # Local scratch / chat exports (do not commit)
 /Untitled
 /plan.jsonl
+
+# Temp planning / handoff notes for agents (anything starting with TEMP)
+TEMP*
