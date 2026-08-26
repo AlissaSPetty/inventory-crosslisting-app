@@ -71,11 +71,10 @@ function pickLiveOfferForMarketplace(
 }
 
 /**
- * Sell Inventory API decides **which** listings exist (Seller Hub “Active” / offer `listingStatus`).
- * Trading (`GetMyeBaySelling` ActiveList) is used only to **enrich** those rows (URL/photo when the
- * REST offer payload is thin). We do **not** append Trading-only rows: they often correspond to
- * legacy or non–Inventory listings that appear under Seller Hub “Inactive” / ended views, not
- * `/sh/lst/active`.
+ * Sell Inventory + live offers is the primary snapshot. `GetMyeBaySelling` ActiveList first
+ * **enriches** those rows, then (see `appendEbayTradingActiveListingsNotInInventorySnapshot`) adds
+ * ActiveList-only lines — listings that are live on eBay but not returned as inventory items (e.g.
+ * classic / non–REST inventory flows) still have `ListingStatus` **Active** in Trading XML.
  */
 function mergeEbayTradingIntoInventoryListings(
   invListings: NormalizedListing[],
@@ -118,6 +117,40 @@ function mergeEbayTradingIntoInventoryListings(
   }
 
   return invListings;
+}
+
+/**
+ * `getInventoryItems` can omit SKUs for listings that were never tied to the Inventory API. Active
+ * list from Trading is already restricted to `ListingStatus` = Active; append rows not already
+ * represented in the inventory snapshot (same item id or SKU as an inv row).
+ */
+function appendEbayTradingActiveListingsNotInInventorySnapshot(
+  invListings: NormalizedListing[],
+  tradingListings: NormalizedListing[]
+): NormalizedListing[] {
+  const out = [...invListings];
+
+  function invCoversTradingRow(t: NormalizedListing): boolean {
+    const tItem = t.externalListingId;
+    const tSku = (t.metadata as { sku?: string } | undefined)?.sku;
+    for (const l of invListings) {
+      const m = l.metadata as { ebayListingId?: string; sku?: string } | undefined;
+      const fromUrl = l.url?.match(/\/itm\/(\d+)/)?.[1];
+      if (m?.ebayListingId && m.ebayListingId === tItem) return true;
+      if (fromUrl && fromUrl === tItem) return true;
+      if (l.externalListingId != null && String(l.externalListingId) === tItem) return true;
+      if (tSku) {
+        if (m?.sku && m.sku === tSku) return true;
+        if (String(l.externalListingId) === tSku) return true;
+      }
+    }
+    return false;
+  }
+
+  for (const t of tradingListings) {
+    if (!invCoversTradingRow(t)) out.push(t);
+  }
+  return out;
 }
 
 /**
@@ -366,8 +399,12 @@ export function createEbayAdapter(sandbox: boolean, ebayMarketplaceId: string): 
             siteId,
           });
           const merged = mergeEbayTradingIntoInventoryListings(listings, tradingListings);
+          const withTradingOnly = appendEbayTradingActiveListingsNotInInventorySnapshot(
+            merged,
+            tradingListings
+          );
           listings.length = 0;
-          listings.push(...merged);
+          listings.push(...withTradingOnly);
         } catch {
           /* Trading supplements Inventory; GUI-created listings may be missing without it */
         }

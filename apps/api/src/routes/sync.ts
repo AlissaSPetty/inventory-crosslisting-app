@@ -114,9 +114,11 @@ const INVENTORY_FETCH_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
  * Remove `platform_listings` that are absent from the latest marketplace snapshot.
  *
  * - **`sync_fetch`**: Mirror rows — if not returned this run, delete (ended / stale import).
- * - **`app`**: **Not pruned here.** Deleting an app row triggers `listing_drafts.published_listing_id`
- *   → `SET NULL`, which puts published items back on the drafts list. Matching can fail when the
- *   Inventory API omits SKUs (env mismatch) or offer payloads differ; updates still merge when matched.
+ * - **`app` (eBay)**: **Not deleted here;** if absent from the live API snapshot, status is set to **`ended`**
+ *   (see `markEbayAppListingsAbsentFromSyncAsEnded`) so the active column updates without `DELETE` →
+ *   `SET NULL` on `listing_drafts.published_listing_id`.
+ * - **`app` (other platforms)**: **Not pruned here.** Deleting an app row triggers the same `SET NULL`;
+ *   matching can fail when APIs omit keys (env mismatch); updates still merge when matched.
  * - **`manual_link`**: Never removed here (not API-authoritative).
  */
 async function prunePlatformListingsAfterFetch(
@@ -141,6 +143,36 @@ async function prunePlatformListingsAfterFetch(
   for (const id of staleIds) {
     const { error: delErr } = await service.from("platform_listings").delete().eq("id", id);
     if (delErr) return { ok: false, message: delErr.message };
+  }
+  return { ok: true };
+}
+
+/**
+ * eBay `app` rows are not pruned (deleting would `SET NULL` on `listing_drafts.published_listing_id`).
+ * When a listing ends, it drops out of the live Inventory API snapshot, so it is not in `touchedListingIds`.
+ * Mark those rows `ended` so the active inventory column matches Seller Hub.
+ */
+async function markEbayAppListingsAbsentFromSyncAsEnded(
+  service: SupabaseClient,
+  userId: string,
+  touchedListingIds: Set<string>
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const { data: appLive, error } = await service
+    .from("platform_listings")
+    .select("id")
+    .eq("user_id", userId)
+    .eq("platform", "ebay")
+    .eq("source", "app")
+    .in("status", ["active", "pending_link"]);
+  if (error) return { ok: false, message: error.message };
+  const now = new Date().toISOString();
+  for (const r of appLive ?? []) {
+    if (touchedListingIds.has(r.id)) continue;
+    const { error: upErr } = await service
+      .from("platform_listings")
+      .update({ status: "ended", last_synced_at: now, updated_at: now })
+      .eq("id", r.id);
+    if (upErr) return { ok: false, message: upErr.message };
   }
   return { ok: true };
 }
@@ -339,6 +371,16 @@ async function executePlatformListingsSync(
     const pruneRes = await prunePlatformListingsAfterFetch(service, userId, platform, touchedListingIds);
     if (!pruneRes.ok) {
       return { status: "failed", message: pruneRes.message };
+    }
+    if (platform === "ebay") {
+      const markEndedRes = await markEbayAppListingsAbsentFromSyncAsEnded(
+        service,
+        userId,
+        touchedListingIds
+      );
+      if (!markEndedRes.ok) {
+        return { status: "failed", message: markEndedRes.message };
+      }
     }
   }
 
