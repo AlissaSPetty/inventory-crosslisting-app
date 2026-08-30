@@ -15,11 +15,15 @@ export async function registerInventoryRoutes(app: FastifyInstance, env: Env) {
   app.get("/api/inventory", async (req, reply) => {
     const auth = await requireAuth(req, reply, env);
     if (!auth) return;
+    // Optional `status` filter; defaults to `active` so existing callers are unchanged.
+    const statusRaw = (req.query as { status?: string }).status?.trim();
+    const status =
+      statusRaw && ["active", "sold", "archived"].includes(statusRaw) ? statusRaw : "active";
     const { data, error } = await auth.supabase
       .from("inventory_items")
       .select("*, inventory_images(count)")
-      .eq("status", "active")
-      .order("created_at", { ascending: false });
+      .eq("status", status)
+      .order(status === "sold" ? "sold_at" : "created_at", { ascending: false });
     if (error) return reply.status(500).send({ error: error.message });
     type Row = (typeof data)[number] & {
       inventory_images?: { count: number }[] | null;
