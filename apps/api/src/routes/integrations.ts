@@ -15,6 +15,7 @@ import {
 } from "../lib/ebayCategoryApi.js";
 import { requireAuth } from "../lib/httpAuth.js";
 import { createServiceSupabase } from "../lib/supabase.js";
+import { pairingCodeHash, randomPairingCode } from "../lib/crypto.js";
 
 const EBAY_API = (sandbox: boolean) =>
   sandbox ? "https://api.sandbox.ebay.com" : "https://api.ebay.com";
@@ -267,6 +268,26 @@ export async function registerIntegrationRoutes(app: FastifyInstance, env: Env) 
     } catch (e) {
       return reply.status(502).send({ error: e instanceof Error ? e.message : String(e) });
     }
+  });
+
+  /**
+   * Mint a short-lived, single-use pairing code the user pastes into the browser
+   * extension to connect Poshmark. The code is returned once (display form) and
+   * stored only as a hash. TTL 10 min. See `routes/extension.ts` for redemption.
+   */
+  app.post("/api/integrations/poshmark/pairing-code", async (req, reply) => {
+    const auth = await requireAuth(req, reply, env);
+    if (!auth) return;
+    const service = createServiceSupabase(env);
+    const code = randomPairingCode();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const { error } = await service.from("extension_pairing_codes").insert({
+      user_id: auth.user.id,
+      code_hash: pairingCodeHash(code),
+      expires_at: expiresAt,
+    });
+    if (error) return reply.status(500).send({ error: error.message });
+    return { code, expiresAt };
   });
 
   app.delete("/api/integrations/:platform", async (req, reply) => {

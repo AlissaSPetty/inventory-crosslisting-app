@@ -6,7 +6,7 @@
     "dev": "pnpm --filter @inv/api --filter @inv/web --parallel run dev",
     "dev:api": "pnpm --filter @inv/api dev",
     "dev:web": "pnpm --filter @inv/web dev",
-    "build": "pnpm --filter @inv/shared build && pnpm --filter @inv/api build && pnpm --filter @inv/web build",
+    "build": "pnpm --filter @inv/shared build && pnpm --filter @inv/api build && pnpm --filter @inv/web build && pnpm --filter @inv/extension build",
     "test": "pnpm --filter @inv/api test",
     "typecheck": "pnpm --filter @inv/shared build && pnpm run -r typecheck",
     "sync:readme": "node scripts/sync-readme-from-handoff.mjs",

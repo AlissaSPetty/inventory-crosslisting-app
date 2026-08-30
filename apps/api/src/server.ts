@@ -12,6 +12,7 @@ import { registerAiRoutes } from "./routes/ai.js";
 import { registerIntegrationRoutes } from "./routes/integrations.js";
 import { registerDraftRoutes } from "./routes/drafts.js";
 import { registerTaskRoutes } from "./routes/tasks.js";
+import { registerExtensionRoutes } from "./routes/extension.js";
 import { registerPhase2Routes } from "./routes/phase2.js";
 import { startEbayRelistScheduler } from "./jobs/ebayRelist.js";
 
@@ -53,6 +54,7 @@ async function main() {
   await registerIntegrationRoutes(app, env);
   await registerDraftRoutes(app, env);
   await registerTaskRoutes(app, env);
+  await registerExtensionRoutes(app, env);
   await registerPhase2Routes(app, env);
 
   app.get("/health", async () => ({ ok: true }));

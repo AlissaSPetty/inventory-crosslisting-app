@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type FormEvent } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { apiFetch } from "../lib/api.js";
+import { PoshmarkExtensionCard } from "../components/PoshmarkExtensionCard.js";
 
 type Connection = {
   platform: string;
@@ -574,6 +575,10 @@ export function IntegrationsPage() {
           <strong>Blocked</strong> until partner API credentials are available.
         </p>
       </div>
+      <PoshmarkExtensionCard
+        connection={connections.find((c) => c.platform === "poshmark")}
+        onConnectionChange={() => queryClient.invalidateQueries({ queryKey: ["integrations"] })}
+      />
       <div className="card">
         <h2>Connected</h2>
         <button type="button" onClick={() => refetch()}>

@@ -8,6 +8,7 @@ import { buildAdapters } from "../lib/adapters/registry.js";
 import { decryptPayload, encryptPayload } from "../lib/credentials.js";
 import { getValidEbayAccessToken, refreshEbayAccessToken } from "../lib/ebayAccessToken.js";
 import type { NormalizedListing } from "../lib/adapters/types.js";
+import { ingestListingSnapshot } from "../lib/ingestSnapshot.js";
 import { PLATFORMS, type Platform } from "@inv/shared";
 
 const platformEnum = z.enum(["ebay", "shopify", "depop", "poshmark", "mercari"]);
@@ -238,11 +239,14 @@ async function executePlatformListingsSync(
     }
   }
 
+  const isEbay = platform === "ebay";
   let cursor: string | undefined;
   let total = 0;
   let ebayInventorySkusFromApi = 0;
-  /** DB row ids matched or created from this pull — everything else mirror-sourced is eligible for prune. */
+  /** eBay: DB row ids matched or created from this pull — everything else mirror-sourced is eligible for prune. */
   const touchedListingIds = new Set<string>();
+  /** Non-eBay: accumulate all pages, then hand to the shared snapshot ingest once the cursor is drained. */
+  const nonEbayListings: NormalizedListing[] = [];
   do {
     let res = await adapter.fetchActiveListings(adapterCreds, cursor);
     if (
@@ -269,71 +273,45 @@ async function executePlatformListingsSync(
       ebayInventorySkusFromApi += res.data.ebayInventorySkusThisPage ?? 0;
     }
     for (const listing of res.data.listings) {
-      let existing: { id: string; source?: string } | null = null;
-      if (platform === "ebay") {
-        existing = await findExistingEbayPlatformListing(service, userId, listing);
-      } else {
-        const { data } = await service
-          .from("platform_listings")
-          .select("id, source")
-          .eq("user_id", userId)
-          .eq("platform", platform)
-          .eq("external_listing_id", listing.externalListingId)
-          .maybeSingle();
-        existing = data;
+      if (!isEbay) {
+        // Non-eBay (Shopify today; any push-fed platform): collect and defer to
+        // the shared snapshot ingest once every page has been drained.
+        nonEbayListings.push(listing);
+        total++;
+        continue;
       }
+      const existing = await findExistingEbayPlatformListing(service, userId, listing);
       if (existing) {
         touchedListingIds.add(existing.id);
-        if (platform === "ebay") {
-          const { data: prevRow } = await service
-            .from("platform_listings")
-            .select("metadata, status, inventory_item_id, source")
-            .eq("id", existing.id)
-            .maybeSingle();
-          const mergedMeta = {
-            ...((prevRow?.metadata as Record<string, unknown>) ?? {}),
-            ...((listing.metadata as Record<string, unknown>) ?? {}),
-          };
-          const syncMirror = prevRow?.source === "sync_fetch";
-          const ebayUpdate: Record<string, unknown> = {
-            listed_quantity: listing.quantity,
-            listing_title: listing.title,
-            /** Mirror rows: always align with API (clear when no image). App/manual rows: omit when absent so Trading merge does not wipe photos. */
-            ...(syncMirror
-              ? { listing_image_url: listing.imageUrl ?? null }
-              : listing.imageUrl
-                ? { listing_image_url: listing.imageUrl }
-                : {}),
-            ...(listing.url ? { listing_url: listing.url } : {}),
-            ...(listing.listedAt ? { listed_at: listing.listedAt } : {}),
-            metadata: mergedMeta,
-            last_synced_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          };
-          if (prevRow?.status === "active" || prevRow?.inventory_item_id) {
-            ebayUpdate.status = "active";
-          }
-          await service.from("platform_listings").update(ebayUpdate).eq("id", existing.id);
-        } else {
-          const syncMirror = existing.source === "sync_fetch";
-          await service
-            .from("platform_listings")
-            .update({
-              listed_quantity: listing.quantity,
-              listing_title: listing.title,
-              ...(syncMirror
-                ? { listing_image_url: listing.imageUrl ?? null }
-                : listing.imageUrl
-                  ? { listing_image_url: listing.imageUrl }
-                  : {}),
-              ...(listing.url ? { listing_url: listing.url } : {}),
-              ...(listing.listedAt ? { listed_at: listing.listedAt } : {}),
-              metadata: listing.metadata ?? {},
-              last_synced_at: new Date().toISOString(),
-              updated_at: new Date().toISOString(),
-            })
-            .eq("id", existing.id);
+        const { data: prevRow } = await service
+          .from("platform_listings")
+          .select("metadata, status, inventory_item_id, source")
+          .eq("id", existing.id)
+          .maybeSingle();
+        const mergedMeta = {
+          ...((prevRow?.metadata as Record<string, unknown>) ?? {}),
+          ...((listing.metadata as Record<string, unknown>) ?? {}),
+        };
+        const syncMirror = prevRow?.source === "sync_fetch";
+        const ebayUpdate: Record<string, unknown> = {
+          listed_quantity: listing.quantity,
+          listing_title: listing.title,
+          /** Mirror rows: always align with API (clear when no image). App/manual rows: omit when absent so Trading merge does not wipe photos. */
+          ...(syncMirror
+            ? { listing_image_url: listing.imageUrl ?? null }
+            : listing.imageUrl
+              ? { listing_image_url: listing.imageUrl }
+              : {}),
+          ...(listing.url ? { listing_url: listing.url } : {}),
+          ...(listing.listedAt ? { listed_at: listing.listedAt } : {}),
+          metadata: mergedMeta,
+          last_synced_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        if (prevRow?.status === "active" || prevRow?.inventory_item_id) {
+          ebayUpdate.status = "active";
         }
+        await service.from("platform_listings").update(ebayUpdate).eq("id", existing.id);
       } else {
         const { data: inserted, error: insErr } = await service
           .from("platform_listings")
@@ -364,6 +342,21 @@ async function executePlatformListingsSync(
     }
     cursor = res.data.nextCursor;
   } while (cursor);
+
+  // Non-eBay: a full pull is a complete snapshot — upsert + prune via the shared helper.
+  if (!isEbay) {
+    const result = await ingestListingSnapshot(service, userId, platform, nonEbayListings, {
+      shopDomain: credRow.shop_domain ?? null,
+      prune: true,
+      complete: true,
+      source: "sync_fetch",
+    });
+    return {
+      status: "synced",
+      importedOrUpdated: result.importedOrUpdated,
+      listingsProcessedFromApi: total,
+    };
+  }
 
   /** Empty `getInventoryItems` is often sandbox vs production token mismatch — do not delete DB rows. */
   const skipEbayPrune = platform === "ebay" && ebayInventorySkusFromApi === 0;

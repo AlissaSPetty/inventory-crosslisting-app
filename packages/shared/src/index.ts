@@ -14,3 +14,4 @@ export type ListingSource = "app" | "sync_fetch" | "manual_link";
 export * from "./draftEditor.js";
 export * from "./draftValidation.js";
 export * from "./ebayConditionNormalize.js";
+export * from "./extension.js";
