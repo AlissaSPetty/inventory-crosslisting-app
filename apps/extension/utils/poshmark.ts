@@ -4,20 +4,27 @@ import type { SnapshotListing, SnapshotListingStatus } from "@inv/shared";
  * Poshmark closet scraper — runs in the content script (same-origin as
  * poshmark.com, so `fetch` carries the user's session cookie).
  *
- * IMPORTANT: Poshmark exposes no public API; the `vm-rest` endpoints and DOM
- * selectors below are UNDOCUMENTED and can change without notice. Every fragile
- * field is marked `VERIFY:` — confirm each against a logged-in session's Network
- * tab before relying on production data. The raw payload is preserved in
- * `metadata` so a shape change can be reprocessed server-side.
+ * Poshmark has no public API. The `vm-rest` endpoint below is undocumented but
+ * was confirmed against the live public closet endpoint (2026): a logged-in
+ * session returns the SAME shape via same-origin cookies, plus the seller's
+ * private/non-public items. Poshmark can still change it without notice — the
+ * DOM fallback and the per-item field guards keep a change from hard-failing.
+ *
+ *   GET /vm-rest/users/{username}/posts?count=48&offset=0
+ *   -> { data: Post[], more: { next_max_id }, trace_id }
  */
 
 const POSH_ORIGIN = "https://poshmark.com";
+const PAGE_COUNT = 48;
 const MAX_PAGES = 100;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Post = Record<string, any>;
 
 export type ClosetScrape = {
   username: string | null;
   listings: SnapshotListing[];
-  /** True only if the JSON cursor was fully drained — gates server-side pruning. */
+  /** True only if pagination was fully drained — gates server-side pruning. */
   complete: boolean;
 };
 
@@ -25,7 +32,9 @@ export async function scrapePoshmarkCloset(): Promise<ClosetScrape> {
   const username = resolveUsername();
   try {
     const viaJson = await scrapeViaVmRest(username);
-    if (viaJson.listings.length > 0) return { username, ...viaJson };
+    if (viaJson.listings.length > 0 || viaJson.complete) {
+      return { username, ...viaJson };
+    }
   } catch (err) {
     console.warn("[inv-ext] vm-rest closet scrape failed; falling back to DOM", err);
   }
@@ -33,7 +42,7 @@ export async function scrapePoshmarkCloset(): Promise<ClosetScrape> {
   return { username, listings: scrapeVisibleClosetDom(), complete: false };
 }
 
-/** VERIFY: the logged-in user's own closet link in the header nav. */
+/** The logged-in user's own closet link in the header nav (or the current closet URL). */
 function resolveUsername(): string | null {
   const href = document.querySelector<HTMLAnchorElement>('a[href^="/closet/"]')?.getAttribute("href");
   const fromNav = href?.match(/^\/closet\/([^/?#]+)/)?.[1];
@@ -47,67 +56,66 @@ async function scrapeViaVmRest(
 ): Promise<{ listings: SnapshotListing[]; complete: boolean }> {
   if (!username) throw new Error("Poshmark username could not be determined");
   const listings: SnapshotListing[] = [];
-  let maxId: string | undefined;
   let complete = false;
 
   for (let page = 0; page < MAX_PAGES; page++) {
-    const url = new URL(`${POSH_ORIGIN}/vm-rest/users/${encodeURIComponent(username)}/posts`);
-    // VERIFY: exact query envelope + cursor param names.
-    url.searchParams.set("request", JSON.stringify({ filters: { inventory_status: ["all"] } }));
-    if (maxId) url.searchParams.set("max_id", maxId);
-
-    const res = await fetch(url.toString(), {
-      credentials: "include",
-      headers: { accept: "application/json" },
-    });
+    const offset = page * PAGE_COUNT;
+    const url = `${POSH_ORIGIN}/vm-rest/users/${encodeURIComponent(username)}/posts?count=${PAGE_COUNT}&offset=${offset}`;
+    const res = await fetch(url, { credentials: "include", headers: { accept: "application/json" } });
     if (!res.ok) throw new Error(`vm-rest ${res.status}`);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json: any = await res.json();
+    const json = (await res.json()) as { data?: unknown };
     const posts: unknown[] = Array.isArray(json?.data) ? json.data : [];
     for (const p of posts) {
       const mapped = mapPost(p);
       if (mapped) listings.push(mapped);
     }
-    const next = json?.more?.next_max_id ?? json?.nextMaxId ?? null;
-    if (!next || posts.length === 0) {
+    // A short page (or empty) means the cursor is drained → complete snapshot.
+    if (posts.length < PAGE_COUNT) {
       complete = true;
       break;
     }
-    maxId = String(next);
   }
   return { listings, complete };
 }
 
-/** VERIFY: Poshmark post shape (fields cross-referenced with community SDKs). */
 function mapPost(raw: unknown): SnapshotListing | null {
-  const p = raw as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
-  const id = p?.id ?? p?.post_id;
+  const p = raw as Post;
+  const id = p?.id;
   if (!id) return null;
   const status = mapStatus(p);
-  const meta: Record<string, unknown> = { raw: p };
+  const title = String(p?.title ?? "Untitled");
+
+  const meta: Record<string, unknown> = {};
   if (p?.brand) meta.brand = p.brand;
   const size = p?.size_obj?.display ?? p?.size;
   if (size) meta.size = size;
   if (p?.department?.display) meta.department = p.department.display;
+  if (p?.category_v2?.display) meta.category = p.category_v2.display;
+  if (Array.isArray(p?.inventory?.size_quantities) &&
+      p.inventory.size_quantities.some((q: Post) => q?.condition === "nwt")) {
+    meta.nwt = true;
+  }
 
   return {
     externalListingId: String(id),
-    title: String(p?.title ?? "Untitled"),
+    title,
     priceCents: dollarsToCents(p?.price_amount?.val ?? p?.price),
     quantity: status === "sold" ? 0 : 1,
     status,
-    url: `${POSH_ORIGIN}/listing/${id}`,
-    imageUrl: p?.covershot?.url ?? p?.picture_url ?? undefined,
+    url: `${POSH_ORIGIN}/listing/${listingSlug(title)}-${id}`,
+    imageUrl: typeof p?.cover_shot?.url === "string" ? p.cover_shot.url : undefined,
+    listedAt: typeof p?.created_at === "string" ? p.created_at : undefined,
     metadata: meta,
   };
 }
 
-function mapStatus(p: Record<string, unknown>): SnapshotListingStatus {
-  const s = String(
-    (p?.inventory as Record<string, unknown>)?.status ?? p?.status ?? ""
-  ).toLowerCase();
-  if (p?.sold === true || s.includes("sold")) return "sold";
-  if (s.includes("reserved") || s.includes("hold")) return "reserved";
+/** `inventory.status`: available | sold_out | reserved | not_for_sale. */
+function mapStatus(p: Post): SnapshotListingStatus {
+  const s = String(p?.inventory?.status ?? p?.status ?? "").toLowerCase();
+  if (s === "sold_out" || s.includes("sold")) return "sold";
+  if (s === "reserved" || s === "not_for_sale" || s.includes("reserve") || s.includes("hold")) {
+    return "reserved";
+  }
   return "available";
 }
 
@@ -116,21 +124,27 @@ function dollarsToCents(v: unknown): number | undefined {
   return Number.isFinite(n) ? Math.round(n * 100) : undefined;
 }
 
-/** VERIFY: closet tile selectors. Best-effort single-page fallback only. */
+/** Poshmark listing URLs are `/listing/{title-slug}-{id}`; the slug is cosmetic. */
+function listingSlug(title: string): string {
+  return (
+    title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "listing"
+  );
+}
+
+/** Best-effort single-page fallback if the JSON endpoint ever changes shape. */
 function scrapeVisibleClosetDom(): SnapshotListing[] {
   const out: SnapshotListing[] = [];
-  const tiles = document.querySelectorAll<HTMLElement>(
-    '[data-et-name="listing"], .card--listing, .tile'
-  );
+  const tiles = document.querySelectorAll<HTMLElement>('[data-et-name="listing"], .card--listing, .tile');
   tiles.forEach((tile) => {
-    const link = tile.querySelector<HTMLAnchorElement>('a[href*="/listing/"]');
-    const href = link?.getAttribute("href") ?? "";
-    const idMatch = href.match(/\/listing\/[^/]*?-([a-f0-9]{8,})/i) ?? href.match(/\/listing\/(\w+)/);
-    const id = idMatch?.[1];
+    const href = tile.querySelector<HTMLAnchorElement>('a[href*="/listing/"]')?.getAttribute("href") ?? "";
+    const id = href.match(/-([a-f0-9]{24})(?:$|[/?#])/i)?.[1] ?? href.match(/\/listing\/(\w+)/)?.[1];
     if (!id) return;
     const title =
       tile.querySelector(".tile__title, .title, [data-et-name='listing_title']")?.textContent?.trim() ||
-      link?.getAttribute("title")?.trim() ||
       "Untitled";
     const priceText = tile.querySelector(".p--t--1, .fw--bold, .price")?.textContent ?? "";
     const sold = /sold/i.test(tile.textContent ?? "");

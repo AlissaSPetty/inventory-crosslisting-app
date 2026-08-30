@@ -111,11 +111,39 @@ export function PoshmarkExtensionCard({
 
       {/* Pairing */}
       <div style={{ marginTop: "0.5rem" }}>
-        <ol style={{ margin: "0 0 0.75rem", paddingLeft: "1.2rem", color: "#475569", fontSize: "0.9rem", lineHeight: 1.6 }}>
-          <li>Install the Inventory browser extension and make sure you're logged into Poshmark.</li>
+        <ol style={{ margin: "0 0 0.5rem", paddingLeft: "1.2rem", color: "#475569", fontSize: "0.9rem", lineHeight: 1.6 }}>
+          <li>Install the Inventory browser extension (see “How to install” below) and log into Poshmark.</li>
           <li>Generate a pairing code here, then paste it into the extension popup.</li>
           <li>The extension reads your closet and keeps quantity in sync.</li>
         </ol>
+        <details style={{ margin: "0 0 0.75rem" }}>
+          <summary style={{ cursor: "pointer", fontSize: "0.9rem", color: "#2563eb" }}>
+            How to install the extension
+          </summary>
+          <div style={{ fontSize: "0.85rem", color: "#475569", lineHeight: 1.6, marginTop: "0.4rem" }}>
+            <p style={{ margin: "0 0 0.4rem" }}>
+              It isn't on the Chrome Web Store yet, so load it in developer mode (one time):
+            </p>
+            <ol style={{ margin: 0, paddingLeft: "1.2rem" }}>
+              <li>
+                Build it: <code>pnpm --filter @inv/extension build</code> — this creates the folder{" "}
+                <code>apps/extension/.output/chrome-mv3</code>.
+              </li>
+              <li>
+                Open <code>chrome://extensions</code> and turn on <strong>Developer mode</strong> (top-right toggle).
+              </li>
+              <li>
+                Click <strong>Load unpacked</strong> and select the{" "}
+                <code>apps/extension/.output/chrome-mv3</code> folder.
+              </li>
+              <li>Pin the extension, open Poshmark logged in, then paste the pairing code below into its popup.</li>
+            </ol>
+            <p style={{ margin: "0.4rem 0 0", fontSize: "0.8rem", color: "#94a3b8" }}>
+              Tip: <code>pnpm --filter @inv/extension dev</code> opens a browser with the extension auto-loaded and
+              live-reloading while developing.
+            </p>
+          </div>
+        </details>
         <button className="primary" type="button" disabled={genCode.isPending} onClick={() => genCode.mutate()}>
           {genCode.isPending ? "Generating…" : "Generate pairing code"}
         </button>
