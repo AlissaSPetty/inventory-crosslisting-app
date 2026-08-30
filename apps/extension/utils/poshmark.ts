@@ -11,8 +11,11 @@ import type { SnapshotListing, SnapshotListingStatus } from "@inv/shared";
  * private/non-public items. Poshmark can still change it without notice — the
  * DOM fallback and the per-item field guards keep a change from hard-failing.
  *
- *   GET /vm-rest/users/{username}/posts?count=48&offset=0
+ *   GET /vm-rest/users/{username}/posts?count=48[&max_id=<cursor>]
  *   -> { data: Post[], more: { next_max_id }, trace_id }
+ *
+ * Pagination is the `more.next_max_id` cursor — the `offset` param is IGNORED by
+ * this endpoint (it always returns page 1), so a cursor walk is required.
  */
 
 const POSH_ORIGIN = "https://poshmark.com";
@@ -62,26 +65,33 @@ async function scrapeViaVmRest(
 ): Promise<{ listings: SnapshotListing[]; complete: boolean }> {
   if (!username) throw new Error("Poshmark username could not be determined");
   const listings: SnapshotListing[] = [];
+  const seen = new Set<string>();
   let complete = false;
+  let maxId: string | null = null;
 
   for (let page = 0; page < MAX_PAGES; page++) {
-    const offset = page * PAGE_COUNT;
-    const url = `${POSH_ORIGIN}/vm-rest/users/${encodeURIComponent(username)}/posts?count=${PAGE_COUNT}&offset=${offset}`;
-    const res = await fetch(url, { credentials: "include", headers: { accept: "application/json" } });
+    const url = new URL(`${POSH_ORIGIN}/vm-rest/users/${encodeURIComponent(username)}/posts`);
+    url.searchParams.set("count", String(PAGE_COUNT));
+    if (maxId != null) url.searchParams.set("max_id", maxId);
+    const res = await fetch(url.toString(), { credentials: "include", headers: { accept: "application/json" } });
     if (!res.ok) {
       // Throttled / transient error: sync what we have so far. `complete:false`
       // means the server will NOT prune, so a partial pull can't delete rows.
       console.warn(`[inv-ext] vm-rest page ${page} HTTP ${res.status}; syncing ${listings.length} collected (partial)`);
       return { listings, complete: false };
     }
-    const json = (await res.json()) as { data?: unknown };
-    const posts: unknown[] = Array.isArray(json?.data) ? json.data : [];
+    const json = (await res.json()) as { data?: unknown; more?: { next_max_id?: unknown } };
+    const posts: unknown[] = Array.isArray(json.data) ? json.data : [];
     for (const p of posts) {
       const mapped = mapPost(p);
-      if (mapped) listings.push(mapped);
+      if (mapped && !seen.has(mapped.externalListingId)) {
+        seen.add(mapped.externalListingId);
+        listings.push(mapped);
+      }
     }
-    // A short page (or empty) means the cursor is drained → complete snapshot.
-    if (posts.length < PAGE_COUNT) {
+    const next = json.more?.next_max_id;
+    // No cursor (or an empty page) means the closet is fully drained.
+    if (next == null || posts.length === 0) {
       complete = true;
       break;
     }
@@ -89,6 +99,7 @@ async function scrapeViaVmRest(
       console.warn(`[inv-ext] reached ${SNAPSHOT_MAX_LISTINGS}-listing cap; syncing partial`);
       return { listings: listings.slice(0, SNAPSHOT_MAX_LISTINGS), complete: false };
     }
+    maxId = String(next);
     await sleep(PAGE_DELAY_MS);
   }
   return { listings, complete };

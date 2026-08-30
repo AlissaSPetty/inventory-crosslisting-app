@@ -32,23 +32,36 @@ export function App() {
 
   const syncNow = async () => {
     setBusy(true);
-    setMsg(null);
+    setMsg("Syncing… a large closet can take ~30–60s.");
     const tabs = await browser.tabs.query({ url: "*://*.poshmark.com/*" });
-    const tabId = tabs[0]?.id;
+    const tab = tabs.find((t) => t.active) ?? tabs[0];
+    const tabId = tab?.id;
     if (tabId == null) {
       setBusy(false);
-      setMsg("Open Poshmark in a tab first, then Sync.");
+      setMsg("Open your Poshmark closet in a tab first, then Sync.");
       return;
     }
+    const send = () =>
+      browser.tabs.sendMessage(tabId, { type: "SYNC_POSHMARK" }) as Promise<SyncResponse>;
     try {
-      const r = (await browser.tabs.sendMessage(tabId, { type: "SYNC_POSHMARK" })) as SyncResponse;
+      let r: SyncResponse;
+      try {
+        r = await send();
+      } catch {
+        // The tab was opened before the extension loaded, so the content script
+        // isn't in it ("Receiving end does not exist"). Reload it, then retry once.
+        setMsg("Refreshing your Poshmark tab…");
+        await browser.tabs.reload(tabId);
+        await new Promise((res) => setTimeout(res, 4000));
+        r = await send();
+      }
       setMsg(
         r.ok
           ? `Synced ${r.imported ?? 0} listing(s)${r.pruned ? `, removed ${r.pruned}` : ""}.`
           : r.error ?? "Sync failed"
       );
-    } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
+    } catch {
+      setMsg("Couldn't reach the Poshmark page. Reload your Poshmark closet tab, then Sync again.");
     } finally {
       setBusy(false);
       void refresh();
