@@ -63,14 +63,20 @@ async function handlePair(code: string, label?: string): Promise<PairResponse> {
 async function handleSnapshot(snapshot: ExtensionSnapshot): Promise<SyncResponse> {
   const token = await getDeviceToken();
   if (!token) return { ok: false, error: "Not paired" };
+  console.log(`[inv-ext] POST ${snapshot.listings.length} listings -> ${API_BASE}`);
   const res = await fetch(`${API_BASE}/api/extension/poshmark/listings`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
     credentials: "omit",
     body: JSON.stringify(snapshot),
   });
-  if (!res.ok) return { ok: false, error: await errText(res) };
+  if (!res.ok) {
+    const error = await errText(res);
+    console.warn("[inv-ext] ingest failed", res.status, error);
+    return { ok: false, error };
+  }
   const data = (await res.json()) as { importedOrUpdated?: number; pruned?: number };
+  console.log("[inv-ext] ingest ok", data);
   return { ok: true, imported: data.importedOrUpdated, pruned: data.pruned };
 }
 

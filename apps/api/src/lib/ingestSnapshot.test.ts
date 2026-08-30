@@ -31,10 +31,10 @@ function makeDb(seed: Row[] = []) {
       table: string;
       op: "select" | "insert" | "update" | "delete";
       filters: Filter[];
-      payload: Row | null;
+      payload: Row | Row[] | null;
       count: boolean;
       mutated: boolean;
-      insertedId?: string;
+      insertedIds?: string[];
     } = { table, op: "select", filters: [], payload: null, count: false, mutated: false };
 
     const b: Record<string, unknown> = {};
@@ -47,7 +47,8 @@ function makeDb(seed: Row[] = []) {
     b.lt = (col: string, val: unknown) => (st.filters.push({ type: "lt", col, val }), b);
     b.order = () => b;
     b.limit = () => b;
-    b.insert = (payload: Row) => ((st.op = "insert"), (st.payload = payload), b);
+    b.range = () => b;
+    b.insert = (payload: Row | Row[]) => ((st.op = "insert"), (st.payload = payload), b);
     b.update = (payload: Row) => ((st.op = "update"), (st.payload = payload), b);
     b.delete = () => ((st.op = "delete"), b);
 
@@ -55,16 +56,19 @@ function makeDb(seed: Row[] = []) {
       if (st.op === "insert") {
         if (!st.mutated) {
           st.mutated = true;
+          const payloads = Array.isArray(st.payload) ? st.payload : [st.payload ?? {}];
           if (st.table === "platform_listings") {
-            const row = { id: `row-${idc++}`, ...(st.payload ?? {}) };
-            rows.push(row);
-            st.insertedId = row.id as string;
+            st.insertedIds = payloads.map((p) => {
+              const row = { id: `row-${idc++}`, ...p };
+              rows.push(row);
+              return row.id as string;
+            });
           } else if (st.table === "sync_events") {
-            syncEvents.push(st.payload ?? {});
+            for (const p of payloads) syncEvents.push(p);
           }
         }
         return st.table === "platform_listings"
-          ? { data: { id: st.insertedId }, error: null }
+          ? { data: (st.insertedIds ?? []).map((id) => ({ id })), error: null }
           : { data: null, error: null };
       }
       if (st.op === "update") {

@@ -1,3 +1,4 @@
+import { SNAPSHOT_MAX_LISTINGS } from "@inv/shared";
 import type { SnapshotListing, SnapshotListingStatus } from "@inv/shared";
 
 /**
@@ -16,7 +17,10 @@ import type { SnapshotListing, SnapshotListingStatus } from "@inv/shared";
 
 const POSH_ORIGIN = "https://poshmark.com";
 const PAGE_COUNT = 48;
-const MAX_PAGES = 100;
+const MAX_PAGES = 200;
+/** Pace requests — Poshmark throttles rapid vm-rest calls (≈1/s sustained). */
+const PAGE_DELAY_MS = 300;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Post = Record<string, any>;
@@ -30,8 +34,10 @@ export type ClosetScrape = {
 
 export async function scrapePoshmarkCloset(): Promise<ClosetScrape> {
   const username = resolveUsername();
+  console.log("[inv-ext] scraping closet for", username);
   try {
     const viaJson = await scrapeViaVmRest(username);
+    console.log(`[inv-ext] scraped ${viaJson.listings.length} listings (complete=${viaJson.complete})`);
     if (viaJson.listings.length > 0 || viaJson.complete) {
       return { username, ...viaJson };
     }
@@ -62,7 +68,12 @@ async function scrapeViaVmRest(
     const offset = page * PAGE_COUNT;
     const url = `${POSH_ORIGIN}/vm-rest/users/${encodeURIComponent(username)}/posts?count=${PAGE_COUNT}&offset=${offset}`;
     const res = await fetch(url, { credentials: "include", headers: { accept: "application/json" } });
-    if (!res.ok) throw new Error(`vm-rest ${res.status}`);
+    if (!res.ok) {
+      // Throttled / transient error: sync what we have so far. `complete:false`
+      // means the server will NOT prune, so a partial pull can't delete rows.
+      console.warn(`[inv-ext] vm-rest page ${page} HTTP ${res.status}; syncing ${listings.length} collected (partial)`);
+      return { listings, complete: false };
+    }
     const json = (await res.json()) as { data?: unknown };
     const posts: unknown[] = Array.isArray(json?.data) ? json.data : [];
     for (const p of posts) {
@@ -74,6 +85,11 @@ async function scrapeViaVmRest(
       complete = true;
       break;
     }
+    if (listings.length >= SNAPSHOT_MAX_LISTINGS) {
+      console.warn(`[inv-ext] reached ${SNAPSHOT_MAX_LISTINGS}-listing cap; syncing partial`);
+      return { listings: listings.slice(0, SNAPSHOT_MAX_LISTINGS), complete: false };
+    }
+    await sleep(PAGE_DELAY_MS);
   }
   return { listings, complete };
 }

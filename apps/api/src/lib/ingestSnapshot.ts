@@ -14,46 +14,50 @@ const INVENTORY_FETCH_EVENT_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 const IMPLAUSIBLE_DROP_FRACTION = 0.2;
 const IMPLAUSIBLE_DROP_MIN_PREV = 5;
 
+/** PostgREST caps a select at ~1000 rows — page the existing-row load. */
+const SELECT_PAGE = 1000;
+/** Bounded parallelism for per-row updates (large closets = thousands of rows). */
+const WRITE_CONCURRENCY = 12;
+const INSERT_CHUNK = 500;
+const DELETE_CHUNK = 200;
+
 export type IngestSnapshotOptions = {
-  /** Stored on newly inserted rows (mirrors `integration_credentials.shop_domain`). */
   shopDomain?: string | null;
-  /** Attempt to prune rows absent from this snapshot. Only honored when `complete`. */
   prune: boolean;
-  /**
-   * True only when the caller fully drained the source cursor. Pruning a partial
-   * snapshot would delete every row not in the partial set — so prune requires this.
-   */
   complete?: boolean;
-  /** Row source for inserts + prune scope. Defaults to `sync_fetch`. */
   source?: ListingSource;
-  /** `sync_events.event_type` recorded at the end. Defaults to `inventory_fetch_completed`. */
   eventType?: string;
-  /** Extra fields merged into the completion event payload (e.g. `{ origin: 'extension' }`). */
   eventPayloadExtra?: Record<string, unknown>;
 };
 
 export type IngestSnapshotResult = {
-  /** Listings processed from the snapshot this run. */
   listingsProcessed: number;
-  /** Live `platform_listings` for this platform after ingest+prune (`active` | `pending_link`). */
   importedOrUpdated: number;
   pruned: number;
   pruneSkipped: boolean;
   pruneSkippedReason?: string;
 };
 
-type PrevRow = {
-  status?: string | null;
-  inventory_item_id?: string | null;
+type ExistingRow = {
+  id: string;
+  external_listing_id: string | null;
+  source: string | null;
+  status: string | null;
+  inventory_item_id: string | null;
+  metadata: Record<string, unknown> | null;
+  listed_quantity: number | null;
+  listing_title: string | null;
+  listing_url: string | null;
+  listing_image_url: string | null;
 };
 
-/**
- * Map a normalized listing status to a `platform_listings.status`.
- * - `sold` → `sold` (kept for history; never pruned).
- * - anything else (available/reserved/active) → live: `active` when the row is
- *   linked to inventory or was already active, else `pending_link`.
- */
-function nextRowStatus(listingStatus: string, prev: PrevRow | null): string {
+const EXISTING_COLS =
+  "id, external_listing_id, source, status, inventory_item_id, metadata, listed_quantity, listing_title, listing_url, listing_image_url";
+
+function nextRowStatus(
+  listingStatus: string,
+  prev: { status?: string | null; inventory_item_id?: string | null } | null
+): string {
   const linked = !!prev?.inventory_item_id;
   if (listingStatus === "sold") return "sold";
   if (!prev) return "pending_link";
@@ -62,18 +66,37 @@ function nextRowStatus(listingStatus: string, prev: PrevRow | null): string {
   return prev.status ?? "pending_link";
 }
 
-async function countLiveListings(
+/** Run `fn` over `items` with bounded concurrency. */
+async function mapPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let idx = 0;
+  const worker = async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      await fn(items[i] as T);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, worker));
+}
+
+/** Load every existing row for (user, platform) — paged past PostgREST's row cap. */
+async function loadExisting(
   service: SupabaseClient,
   userId: string,
   platform: Platform
-): Promise<number> {
-  const { count } = await service
-    .from("platform_listings")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId)
-    .eq("platform", platform)
-    .in("status", ["active", "pending_link"]);
-  return count ?? 0;
+): Promise<ExistingRow[]> {
+  const rows: ExistingRow[] = [];
+  for (let from = 0; ; from += SELECT_PAGE) {
+    const { data } = await service
+      .from("platform_listings")
+      .select(EXISTING_COLS)
+      .eq("user_id", userId)
+      .eq("platform", platform)
+      .range(from, from + SELECT_PAGE - 1);
+    const batch = (data ?? []) as ExistingRow[];
+    rows.push(...batch);
+    if (batch.length < SELECT_PAGE) break;
+  }
+  return rows;
 }
 
 async function trimOldInventoryFetchSyncEvents(
@@ -94,13 +117,14 @@ async function trimOldInventoryFetchSyncEvents(
 /**
  * Upsert a marketplace listing snapshot into `platform_listings`, then optionally
  * prune rows absent from the snapshot. Shared by the API sync path
- * (`executePlatformListingsSync`, non-eBay) and the extension push endpoint —
- * one FETCHes the snapshot, the other PUSHes it.
+ * (`executePlatformListingsSync`, non-eBay) and the extension push endpoint.
  *
- * Match key is `(user_id, platform, external_listing_id)`. `manual_link` rows
- * (hand-curated) keep their title/image/metadata; only factual marketplace state
- * (quantity, status, url) is refreshed on them. Prune only ever removes rows of
- * the configured `source`.
+ * Scales to large closets (thousands of listings): existing rows are loaded once
+ * (paged), new rows are bulk-inserted, updates run with bounded concurrency, and
+ * stale rows are bulk-deleted. Match key is `(user_id, platform,
+ * external_listing_id)`. `manual_link` rows keep their title/image/metadata; only
+ * factual marketplace state (quantity, status, url) is refreshed. Prune only ever
+ * removes rows of the configured `source`.
  */
 export async function ingestListingSnapshot(
   service: SupabaseClient,
@@ -114,27 +138,43 @@ export async function ingestListingSnapshot(
   const nowIso = new Date().toISOString();
   const nowMs = Date.parse(nowIso);
 
-  const prevLiveCount = await countLiveListings(service, userId, platform);
+  const existing = await loadExisting(service, userId, platform);
+  const byExt = new Map<string, ExistingRow>();
+  let prevLiveCount = 0;
+  for (const r of existing) {
+    if (r.external_listing_id != null) byExt.set(r.external_listing_id, r);
+    if (r.status === "active" || r.status === "pending_link") prevLiveCount++;
+  }
 
-  /** DB row ids matched or created from this snapshot — everything else of this source is prune-eligible. */
-  const touchedListingIds = new Set<string>();
+  const touched = new Set<string>();
+  const toInsert: Record<string, unknown>[] = [];
 
-  for (const listing of listings) {
-    const { data: existing } = await service
-      .from("platform_listings")
-      .select("id, source, status, inventory_item_id, metadata")
-      .eq("user_id", userId)
-      .eq("platform", platform)
-      .eq("external_listing_id", listing.externalListingId)
-      .maybeSingle();
-
-    const rowStatus = nextRowStatus(listing.status, existing ?? null);
-
-    if (existing) {
-      touchedListingIds.add(existing.id);
-      const isManual = existing.source === "manual_link";
+  // Updates run concurrently against existing rows; new rows are collected for bulk insert.
+  await mapPool(listings, WRITE_CONCURRENCY, async (listing) => {
+    const ex = byExt.get(listing.externalListingId) ?? null;
+    const rowStatus = nextRowStatus(listing.status, ex);
+    if (ex) {
+      touched.add(ex.id);
+      const isManual = ex.source === "manual_link";
+      // Skip rows whose material fields are unchanged — a large re-sync then only
+      // writes what actually changed (price drops, sold, new/removed listings).
+      const desiredTitle = isManual ? ex.listing_title : listing.title;
+      const desiredImage = isManual
+        ? ex.listing_image_url
+        : listing.imageUrl ?? (source === "sync_fetch" ? null : ex.listing_image_url);
+      const desiredUrl = listing.url ?? ex.listing_url;
+      const exPrice = (ex.metadata as { priceCents?: unknown } | null)?.priceCents ?? null;
+      const newPrice = (listing.metadata as { priceCents?: unknown } | undefined)?.priceCents ?? null;
+      const unchanged =
+        ex.status === rowStatus &&
+        (ex.listed_quantity ?? null) === listing.quantity &&
+        (ex.listing_title ?? null) === (desiredTitle ?? null) &&
+        (ex.listing_image_url ?? null) === (desiredImage ?? null) &&
+        (ex.listing_url ?? null) === (desiredUrl ?? null) &&
+        exPrice === newPrice;
+      if (unchanged) return;
       const mergedMeta = {
-        ...((existing.metadata as Record<string, unknown>) ?? {}),
+        ...((ex.metadata as Record<string, unknown>) ?? {}),
         ...((listing.metadata as Record<string, unknown>) ?? {}),
       };
       const update: Record<string, unknown> = {
@@ -146,37 +186,36 @@ export async function ingestListingSnapshot(
         last_synced_at: nowIso,
         updated_at: nowIso,
       };
-      // Hand-curated rows: refresh factual marketplace state only, never clobber
-      // the user's title/photo.
       if (!isManual) {
         update.listing_title = listing.title;
         if (listing.imageUrl) update.listing_image_url = listing.imageUrl;
         else if (source === "sync_fetch") update.listing_image_url = null;
       }
-      await service.from("platform_listings").update(update).eq("id", existing.id);
+      await service.from("platform_listings").update(update).eq("id", ex.id);
     } else {
-      const { data: inserted } = await service
-        .from("platform_listings")
-        .insert({
-          user_id: userId,
-          inventory_item_id: null,
-          platform,
-          external_listing_id: listing.externalListingId,
-          shop_domain: opts.shopDomain ?? null,
-          listing_url: listing.url ?? null,
-          listing_title: listing.title,
-          listing_image_url: listing.imageUrl ?? null,
-          listed_at: listing.listedAt ?? nowIso,
-          status: rowStatus,
-          listed_quantity: listing.quantity,
-          source,
-          metadata: listing.metadata ?? {},
-          last_synced_at: nowIso,
-        })
-        .select("id")
-        .single();
-      if (inserted?.id) touchedListingIds.add(inserted.id);
+      toInsert.push({
+        user_id: userId,
+        inventory_item_id: null,
+        platform,
+        external_listing_id: listing.externalListingId,
+        shop_domain: opts.shopDomain ?? null,
+        listing_url: listing.url ?? null,
+        listing_title: listing.title,
+        listing_image_url: listing.imageUrl ?? null,
+        listed_at: listing.listedAt ?? nowIso,
+        status: rowStatus,
+        listed_quantity: listing.quantity,
+        source,
+        metadata: listing.metadata ?? {},
+        last_synced_at: nowIso,
+      });
     }
+  });
+
+  for (let i = 0; i < toInsert.length; i += INSERT_CHUNK) {
+    const chunk = toInsert.slice(i, i + INSERT_CHUNK);
+    const { data: inserted } = await service.from("platform_listings").insert(chunk).select("id");
+    for (const r of (inserted ?? []) as { id: string }[]) touched.add(r.id);
   }
 
   // Prune: remove rows of this source absent from the snapshot — but only when the
@@ -184,8 +223,7 @@ export async function ingestListingSnapshot(
   let pruned = 0;
   let pruneSkipped = false;
   let pruneSkippedReason: string | undefined;
-  const wantsPrune = opts.prune;
-  if (!wantsPrune) {
+  if (!opts.prune) {
     pruneSkipped = true;
     pruneSkippedReason = "prune_disabled";
   } else if (opts.complete === false) {
@@ -196,27 +234,29 @@ export async function ingestListingSnapshot(
     pruneSkippedReason = "empty_snapshot";
   } else if (
     prevLiveCount >= IMPLAUSIBLE_DROP_MIN_PREV &&
-    touchedListingIds.size < prevLiveCount * IMPLAUSIBLE_DROP_FRACTION
+    touched.size < prevLiveCount * IMPLAUSIBLE_DROP_FRACTION
   ) {
     pruneSkipped = true;
     pruneSkippedReason = "implausible_drop";
   }
 
   if (!pruneSkipped) {
-    const { data: mirror } = await service
-      .from("platform_listings")
-      .select("id")
-      .eq("user_id", userId)
-      .eq("platform", platform)
-      .eq("source", source);
-    const staleIds = (mirror ?? []).map((r) => r.id).filter((id) => !touchedListingIds.has(id));
-    for (const id of staleIds) {
-      await service.from("platform_listings").delete().eq("id", id);
-      pruned++;
+    const staleIds = existing.filter((r) => r.source === source && !touched.has(r.id)).map((r) => r.id);
+    for (let i = 0; i < staleIds.length; i += DELETE_CHUNK) {
+      const chunk = staleIds.slice(i, i + DELETE_CHUNK);
+      if (chunk.length === 0) continue;
+      await service.from("platform_listings").delete().in("id", chunk);
+      pruned += chunk.length;
     }
   }
 
-  const liveCount = await countLiveListings(service, userId, platform);
+  const { count: liveCount } = await service
+    .from("platform_listings")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .eq("platform", platform)
+    .in("status", ["active", "pending_link"]);
+  const live = liveCount ?? 0;
 
   await trimOldInventoryFetchSyncEvents(service, userId, eventType, nowMs);
   await service.from("sync_events").insert({
@@ -225,7 +265,7 @@ export async function ingestListingSnapshot(
     payload: {
       platform,
       listingsProcessed: listings.length,
-      liveListingsInApp: liveCount,
+      liveListingsInApp: live,
       pruned,
       ...(pruneSkipped ? { pruneSkipped, pruneSkippedReason } : {}),
       ...(opts.eventPayloadExtra ?? {}),
@@ -234,7 +274,7 @@ export async function ingestListingSnapshot(
 
   return {
     listingsProcessed: listings.length,
-    importedOrUpdated: liveCount,
+    importedOrUpdated: live,
     pruned,
     pruneSkipped,
     pruneSkippedReason,
